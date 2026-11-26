@@ -1,0 +1,36 @@
+From: kenh0u <21225079+kenh0u@users.noreply.github.com>
+Subject: [PATCH] comet-nixos: ksud の自己復旧を init.rc フックに追加 (userdata wipe 対応)
+
+カーネルが注入する KERNEL_SU_RC (on post-fs-data) の先頭に、
+/system/bin/ksud (OS 側で cc_prebuilt_binary として system に同梱) から
+/data/adb/ksud を復元する行を追加する。
+
+- userdata wipe 直後の初回起動では /data/adb/ksud が存在せず、従来は exec が
+  ENOENT で失敗して ksud / throne tracker が一度も走らなかった
+  (Manager が「未インストール」表示)。
+- toybox cp -n (上書きしない) なので、既存の /data/adb/ksud (boot-patch 等で
+  更新された新しい版を含む) は保持される。
+- exec の seclabel で ksu ドメイン (カーネル側で permissive / allow all を
+  注入) に遷移して実行する。init の builtin (mkdir/copy/chmod 等) は
+  u:r:<ctx> プレフィックスに対応せず init 自身のコンテキストで動くため、
+  この形にしている。
+
+OS 側には ksud バイナリを /system/bin/ksud として PRODUCT_PACKAGES に
+含める必要がある (system の file_contexts 既定 system_file のまま)。
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+diff --git a/drivers/kernelsu/runtime/ksud_integration.c b/drivers/kernelsu/runtime/ksud_integration.c
+index 5bf84cb..f75f281 100644
+--- a/drivers/kernelsu/runtime/ksud_integration.c
++++ b/drivers/kernelsu/runtime/ksud_integration.c
+@@ -34,6 +34,9 @@ static const char KERNEL_SU_RC[] =
+     "\n"
+     "on post-fs-data\n"
+     "    start logd\n"
++    // userdata wipe 直後等で /data/adb/ksud が失われている場合、system に同梱した
++    // ksud から自己復旧する。既存の /data/adb/ksud は上書きしない。
++    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- /system/bin/toybox cp -n /system/bin/ksud " KSUD_PATH "\n"
+     // We should wait for the post-fs-data finish
+     "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " post-fs-data\n"
+     "\n"

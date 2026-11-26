@@ -4,7 +4,7 @@ GrapheneOS 公式カーネルツリー（branch `17`, `6.1.177-android14-11`）�
 
 対象デバイス: Google Pixel 9 Pro Fold (`comet` / Tensor G4 / `zumapro`)
 
-> **検証状況**: GrapheneOS フルビルド（`user` バリアント `2026112600`）との組み合わせで実機ブート、KernelSU full モード（`lkm: true`, `late_load: false`）、および NixOS 26.05 (`systemd` PID 1) コンテナ + Termux-X11 GUI の稼働を実機で確認済みです。
+> **検証状況**: GrapheneOS フルビルド（`user` バリアント）との組み合わせで実機ブート、KernelSU full モード（`lkm: true`, `late_load: false`）、および NixOS 26.05 (`systemd` PID 1) コンテナ + Termux-X11 GUI の稼働を実機で確認済みです。`0015` (ksud 自己復旧) は `2026112602` で検証中です。
 
 ## 構成
 
@@ -19,10 +19,11 @@ patches/aosp/     aosp/ 側パッチシリーズ (comet-nixos)
                   0011 irq affinity_hint 読み出しの fault-tolerant 化
                   0012 CONFIG_CFI_PERMISSIVE=y
                   0013-0014 DRM ログ ratelimit / コメント調整
+                  0015 ksud 自己復旧 (init.rc フックで /system/bin/ksud → /data/adb/ksud)
 patches/device/   private/devices/google/comet 側 (fragment filegroup 登録 + device.bazelrc)
 patches/kleaf/    build/kernel/kleaf/hermetic_tools.bzl の NixOS ホストビルド対応
 nixos/            nixos_gki.fragment (namespace, cgroup pids, tmpfs xattr/POSIX ACL, KSU 等)
-ksu/              drivers/kernelsu (tgid != 1 hook 対応込み) + kernel/ksu_module_exports.c
+ksu/              drivers/kernelsu (tgid != 1 hook 対応 + ksud 自己復旧込み) + kernel/ksu_module_exports.c
 ```
 
 ## 主なカーネル拡張ポイント
@@ -32,6 +33,11 @@ ksu/              drivers/kernelsu (tgid != 1 hook 対応込み) + kernel/ksu_mo
   - `ksu/kernelsu-src/core/init.c` で `tgid != 1` でも KSU hook 初期化が走るように調整。
   - `kernelsu.ko` を `system_dlkm` ではなく `vendor_kernel_boot`（`vendor_kernel_boot.modules.load`）から初期読み込みし、full モード（`late_load: false`）で動作。
 - **`.ko` モジュール署名**: ビルド後の未署名 `.ko` は該当ビルドの `scripts/sign-file` と `certs/signing_key.{pem,x509}` で再署名して `comet-kernels` に反映。
+  - **注意**: kleaf はカーネルをビルドするたびに `certs/signing_key.*` を新規生成します (bazel-out の `kernel_aarch64/certs/` にのみ存在)。ビルド直後に `certs/signing_key.{pem,x509}` と `scripts/sign-file` を bazel-out の外へ退避し、署名前に「退避した x509 が dist の `Image` 内に埋め込まれているか」を確認してください。別ビルドの鍵で署名すると lockdown 下で insmod が EPERM になり起動しません。
+- **ksud 自己復旧 (userdata wipe 対応, `0015`)**:
+  - OS 側に `ksud` を `cc_prebuilt_binary` として `/system/bin/ksud` に同梱し、`PRODUCT_PACKAGES += ksud` で組み込む。
+  - カーネル注入の `on post-fs-data` 冒頭で `ksu` ドメインの `exec` として `/system/bin/toybox cp -n /system/bin/ksud /data/adb/ksud` を実行し、無い場合に復元する (`-n` なので既存分は上書きしない)。
+  - これにより userdata wipe 直後の `user` 版 + relocked 端末でも、初回起動から KernelSU が有効になる。
 
 ## ビルド (NixOS ホスト)
 

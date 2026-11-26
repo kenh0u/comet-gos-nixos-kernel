@@ -34,6 +34,9 @@ static const char KERNEL_SU_RC[] =
     "\n"
     "on post-fs-data\n"
     "    start logd\n"
+    // userdata wipe 直後等で /data/adb/ksud が失われている場合、system に同梱した
+    // ksud から自己復旧する。既存の /data/adb/ksud は上書きしない。
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- /system/bin/toybox cp -n /system/bin/ksud " KSUD_PATH "\n"
     // We should wait for the post-fs-data finish
     "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " post-fs-data\n"
     "\n"
