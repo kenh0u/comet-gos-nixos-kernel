@@ -1,0 +1,6 @@
+# Lines to append to vendor/google_devices/comet/comet.mk.
+# The OS tree (vendor/google_devices/comet) is not tracked by this repository;
+# apply by hand together with ksud/Android.bp and the ksud binary.
+
+# KernelSU userspace daemon (/system/bin/ksud), restored to /data/adb/ksud by the kernel's init.rc hook
+PRODUCT_PACKAGES += ksud

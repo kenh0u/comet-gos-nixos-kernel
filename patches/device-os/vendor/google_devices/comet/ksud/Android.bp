@@ -1,0 +1,10 @@
+// KernelSU userspace daemon, bundled into /system so that the kernel's
+// injected init.rc can restore /data/adb/ksud after a userdata wipe.
+cc_prebuilt_binary {
+    name: "ksud",
+    srcs: ["ksud"],
+    owner: "google_devices",
+    vendor: false,
+    strip: { none: true },
+    check_elf_files: false,
+}

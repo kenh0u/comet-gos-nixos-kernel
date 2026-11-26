@@ -4,7 +4,7 @@ GrapheneOS 公式カーネルツリー（branch `17`, `6.1.177-android14-11`）�
 
 対象デバイス: Google Pixel 9 Pro Fold (`comet` / Tensor G4 / `zumapro`)
 
-> **検証状況**: GrapheneOS フルビルド（`user` バリアント）との組み合わせで実機ブート、KernelSU full モード（`lkm: true`, `late_load: false`）、および NixOS 26.05 (`systemd` PID 1) コンテナ + Termux-X11 GUI の稼働を実機で確認済みです。`0015` (ksud 自己復旧) は `2026112603` で検証中です。
+> **検証状況**: GrapheneOS フルビルド（`user` バリアント）との組み合わせで実機ブート、KernelSU full モード（`lkm: true`, `late_load: false`）、および NixOS 26.05 (`systemd` PID 1) コンテナ + Termux-X11 GUI の稼働を実機で確認済みです。`0015` (ksud 自己復旧) は `user` 版 `2026112603` + relocked bootloader で、userdata wipe 直後の初回起動と Recovery からの無 wipe OTA (`adb sideload`) の両方で検証済みです。
 
 ## 構成
 
@@ -20,6 +20,7 @@ patches/aosp/     aosp/ 側パッチシリーズ (comet-nixos)
                   0012 CONFIG_CFI_PERMISSIVE=y
                   0013-0014 DRM ログ ratelimit / コメント調整
                   0015 ksud 自己復旧 (init.rc フックで /system/bin/ksud → /data/adb/ksud)
+patches/device-os/ GrapheneOS OS 側 (vendor/google_devices/comet): ksud を /system/bin/ksud として同梱するための Android.bp と comet.mk 追記行
 patches/device/   private/devices/google/comet 側 (fragment filegroup 登録 + device.bazelrc)
 patches/kleaf/    build/kernel/kleaf/hermetic_tools.bzl の NixOS ホストビルド対応
 nixos/            nixos_gki.fragment (namespace, cgroup pids, tmpfs xattr/POSIX ACL, KSU 等)
@@ -34,11 +35,9 @@ ksu/              drivers/kernelsu (tgid != 1 hook 対応 + ksud 自己復旧込
   - `kernelsu.ko` を `system_dlkm` ではなく `vendor_kernel_boot`（`vendor_kernel_boot.modules.load`）から初期読み込みし、full モード（`late_load: false`）で動作。
 - **`.ko` モジュール署名**: ビルド後の未署名 `.ko` は該当ビルドの `scripts/sign-file` と `certs/signing_key.{pem,x509}` で再署名して `comet-kernels` に反映。
   - **注意**: kleaf はカーネルをビルドするたびに `certs/signing_key.*` を新規生成します (bazel-out の `kernel_aarch64/certs/` にのみ存在)。ビルド直後に `certs/signing_key.{pem,x509}` と `scripts/sign-file` を bazel-out の外へ退避し、署名前に「退避した x509 が dist の `Image` 内に埋め込まれているか」を確認してください。別ビルドの鍵で署名すると lockdown 下で insmod が EPERM になり起動しません。
-- **ksud 自己復旧 (userdata wipe 対応, `0015`)**:
-  - OS 側に `ksud` を `cc_prebuilt_binary` として `/system/bin/ksud` に同梱し、`PRODUCT_PACKAGES += ksud` で組み込む。
-  - カーネル注入の `on post-fs-data` 冒頭で `ksu` ドメインの `exec` として `/system/bin/toybox cp -n /system/bin/ksud /data/adb/ksud` を実行し、無い場合に復元する (`-n` なので既存分は上書きしない)。
-  - 直後に `toybox chcon u:object_r:ksu_file:s0 /data/adb/ksud` で relabel する。`adb_data_file` のままだと init からの `exec` が SELinux に拒否され init が abort する。
-  - これにより userdata wipe 直後の `user` 版 + relocked 端末でも、初回起動から KernelSU が有効になる。
+- **ksud 自己復旧 (userdata wipe 対応, `0015`)**: `user` 版 + relocked 端末で userdata wipe 直後の初回起動から KernelSU を有効にします。詳細 (失敗した試みの内訳、OS 側の組み込み方、署名鍵の罠) は [docs/ksud-self-restore.md](docs/ksud-self-restore.md) を参照。
+  - OS 側に `ksud` を `cc_prebuilt_binary` として `/system/bin/ksud` に同梱 (`patches/device-os/`)。
+  - カーネル注入の `on post-fs-data` 冒頭で、`ksu` ドメインの `exec` として `toybox cp -n` で `/data/adb/ksud` へ復元し、`toybox chcon` で `ksu_file` へ relabel してから `ksud post-fs-data` を起動。
 
 ## ビルド (NixOS ホスト)
 
@@ -65,3 +64,7 @@ NixOS ホストでは kleaf の `hermetic_tools` が `PATH` を切り離すた�
 
 - カーネル側差分: GPL-2.0-only（上流 Linux カーネルに準拠）
 - KernelSU (`ksu/kernelsu-src`): 上流 KernelSU のライセンスに準拠
+
+## ライセンスに関する補足
+
+- `ksud` バイナリは KernelSU 由来です。ライセンスは上流 KernelSU に準拠します。本リポジトリはバイナリを頒布せず、組み込み方 (`Android.bp` / `comet.mk`) のみを収録しています。バイナリは使用する `kernelsu.ko` と同じバージョンの公式 release から入手してください。
