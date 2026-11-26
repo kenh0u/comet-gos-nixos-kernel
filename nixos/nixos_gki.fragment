@@ -1,0 +1,142 @@
+# nixos_gki.fragment — comet-nixos 拡張(最小化 namespace + USB デバイス網羅)
+#
+# 方針 :
+#   - =y 化はコンテナで実際に使う namespace のみ。
+#     NAMESPACES/UTS_NS/NET_NS は GKI 既定 =y のため触らない
+#     (NET_NS は host モード運用のため分離も使わない)
+#   - CGROUPS/MEMCG/CGROUP_SCHED/CPUSETS は GKI 既定 =y のまま放置
+#   - コンソール/FB 系の組込み化は廃止(標準 GKI 構成)
+#   - USB デバイスドライバは upstream NixOS/Ubuntu 基準で可能な限り =m 化し
+#     system_dlkm に載せる(ESP32 の CH340/CP210x、USB-CAN、USB-Ethernet、
+#     QMI/RNDIS モデム、Bluetooth USB ドングル等)
+#
+# ---- namespace (コンテナ) ----
+# PID_NS は gki_defconfig で明示的に =n されているため =y へ変更
+CONFIG_PID_NS=y
+# USER_NS は既定 =n のため =y へ変更
+CONFIG_USER_NS=y
+
+# ---- systemd / NixOS コンテナ向け tmpfs xattr/ACL・cgroup pids (2026-11-26) ----
+# TMPFS_XATTR/POSIX_ACL: /run/wrappers (tmpfs) 上の NixOS security-wrapper が
+# /proc/self/exe の security.capability を読む際の EOPNOTSUPP 解消と systemd-tmpfiles ACL 対応
+# CGROUP_PIDS: systemd の TasksMax= / pids コントローラ対応
+CONFIG_TMPFS_XATTR=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_CGROUP_PIDS=y
+
+# ---- VT (finix コンテナ内の libseat/labwc が /dev/tty0 を要求する) ----
+# Android 既定は =n だが、外画面の Wayland セッション(seatd/libseat)に必要。
+# VT_CONSOLE は実体コンソールドライバ無しで /dev/tty0 のみの提供でも無害。
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+CONFIG_CONSOLE_TRANSLATIONS=y
+CONFIG_VT_HW_CONSOLE_BINDING=y
+CONFIG_UNIX98_PTYS=y
+
+# ---- USB serial (=m。FTDI_SIO 等の一部は GKI 既定で =m 済み) ----
+CONFIG_USB_SERIAL=m
+CONFIG_USB_SERIAL_GENERIC=y
+CONFIG_USB_SERIAL_SIMPLE=m
+CONFIG_USB_SERIAL_AIRCABLE=m
+CONFIG_USB_SERIAL_ARK3116=m
+CONFIG_USB_SERIAL_BELKIN=m
+CONFIG_USB_SERIAL_CH341=m
+CONFIG_USB_SERIAL_CP210X=m
+CONFIG_USB_SERIAL_CYBERJACK=m
+CONFIG_USB_SERIAL_CYPRESS_M8=m
+CONFIG_USB_SERIAL_DIGI_ACCELEPORT=m
+CONFIG_USB_SERIAL_EMPEG=m
+CONFIG_USB_SERIAL_F81232=m
+CONFIG_USB_SERIAL_F8153X=m
+CONFIG_USB_SERIAL_GARMIN=m
+CONFIG_USB_SERIAL_IPAQ=m
+CONFIG_USB_SERIAL_IPW=m
+CONFIG_USB_SERIAL_IR=m
+CONFIG_USB_SERIAL_IUU=m
+CONFIG_USB_SERIAL_KEYSPAN=m
+CONFIG_USB_SERIAL_KEYSPAN_PDA=m
+CONFIG_USB_SERIAL_KLSI=m
+CONFIG_USB_SERIAL_KOBIL_SCT=m
+CONFIG_USB_SERIAL_MCT_U232=m
+CONFIG_USB_SERIAL_METRO=m
+CONFIG_USB_SERIAL_MOS7720=m
+CONFIG_USB_SERIAL_MOS7840=m
+CONFIG_USB_SERIAL_MXUPORT=m
+CONFIG_USB_SERIAL_NAVMAN=m
+CONFIG_USB_SERIAL_OMNINET=m
+CONFIG_USB_SERIAL_OPTICON=m
+CONFIG_USB_SERIAL_OPTION=m
+CONFIG_USB_SERIAL_OTI6858=m
+CONFIG_USB_SERIAL_PL2303=m
+CONFIG_USB_SERIAL_QCAUX=m
+CONFIG_USB_SERIAL_QUALCOMM=m
+CONFIG_USB_SERIAL_QT2=m
+CONFIG_USB_SERIAL_SPCP8X5=m
+CONFIG_USB_SERIAL_SAFE=m
+CONFIG_USB_SERIAL_SIERRAWIRELESS=m
+CONFIG_USB_SERIAL_SYMBOL=m
+CONFIG_USB_SERIAL_TI=m
+CONFIG_USB_SERIAL_UPD78F0730=m
+CONFIG_USB_SERIAL_VISOR=m
+CONFIG_USB_SERIAL_WHITEHEAT=m
+CONFIG_USB_SERIAL_XR=m
+CONFIG_USB_SERIAL_XSENS_MT=m
+# USB_SERIAL_WWAN は OPTION/QCserial 等の共通下支え
+CONFIG_USB_SERIAL_WWAN=m
+
+# ---- USB Ethernet / モデム (=m。AX88179/RTL8152 等は既定で =m 済み) ----
+CONFIG_USB_USBNET=m
+CONFIG_USB_NET_QMI_WWAN=m
+CONFIG_USB_NET_RNDIS_HOST=m
+CONFIG_USB_NET_CDC_MBIM=m
+CONFIG_USB_NET_SMSC95XX=m
+CONFIG_USB_WDM=m
+
+# ---- USB Bluetooth ドングル ----
+CONFIG_BT=m
+CONFIG_BT_HCIBTUSB=m
+CONFIG_BT_HCIBTUSB_BCM=y
+CONFIG_BT_HCIBTUSB_MTK=y
+CONFIG_BT_HCIBTUSB_RTL=y
+
+# ---- USB CAN (candleLight gs_usb / PEAK / Kvaser 等) ----
+CONFIG_CAN=m
+CONFIG_CAN_RAW=m
+CONFIG_CAN_BCM=m
+CONFIG_CAN_DEV=m
+CONFIG_CAN_GS_USB=m
+CONFIG_CAN_PEAK_USB=m
+CONFIG_CAN_KVASER_USB=m
+CONFIG_CAN_8DEV_USB=m
+CONFIG_CAN_MCBA_USB=m
+CONFIG_CAN_UCAN=m
+CONFIG_CAN_ESD_USB=m
+CONFIG_CAN_ETAS_ES58X=m
+
+# ---- その他 USB クラス ----
+CONFIG_USB_PRINTER=m
+
+# ---- KernelSU (kprobe+LSM hook 方式。KPROBES/EXT4_FS は GKI 既定で成立) ----
+# LKM 化: =m で kernelsu.ko を GKI モジュールとしてビルドし、
+# 起動時に読み込む構成にする。KSU version の更新は .ko 差し替えのみで済む。
+CONFIG_KSU=m
+
+# ---- リリース文字列の短縮(64 文字制限対策, 2026-09-26) ----
+# CONFIG_LOCALVERSION_AUTO is not set
+
+# ---- CFI: vender module との type hash 不一致を寛容に(2026-10-05) ----
+# Samsung の vendor_dlkm 既定モジュール(ehld, exynos_pmu_if, usb_f_etr_miu 等)の
+# sysfs show が dev_attr_show の CFI type 0xdf43c25c と合わず Oops が連発する
+# (Oct-4/5 の panic はこの Oops 連鎖が台風の目になって hard HANG に発展)。
+# PERMISSIVE にすると CFI 失敗が WARN(1 回許可して継続)になり、attr read は
+# 正常に通る。CFI 自体は有効のまま。
+CONFIG_CFI_PERMISSIVE=y
+
+# ---- module signature(GrapheneOS 公式 ROM の system_dlkm/vendor_dlkm モ
+# ジュールと混在させるため署名検証を外す。MODSIGN の build 内鍵は GrapheneOS
+# ビルド鍵と一致しないので FORCE のままだと全 module が load 拒否になる)
+
+# MODULE_SIG は security/lockdown(Kconfig)の select で y 固定なので外せない。
+# 代わりに FORCE を解除し、鍵不一致のモジュール(公式 GrapheneOS の
+# system_dlkm/vendor_dlkm)は taint しつつ load させる。
+# CONFIG_MODULE_SIG_FORCE is not set

@@ -1,0 +1,27 @@
+diff --git a/build/kernel/kleaf/hermetic_tools.bzl b/build/kernel/kleaf/hermetic_tools.bzl
+index 027b5fe0..b780e861 100644
+--- a/build/kernel/kleaf/hermetic_tools.bzl
++++ b/build/kernel/kleaf/hermetic_tools.bzl
+@@ -238,10 +238,19 @@ def _handle_host_tools(ctx, hermetic_base, deps):
+ 
+     command = """
+             set -e
+-          # export PATH so which can work
+-            export PATH
++          # comet-nixos: run_shell は env - で起動され PATH が
++          # 保証されないため、host tool の解決を which でなく build_tools_resolved
++          # (事前に resolution 済みの nix store パス)へ変更。
++          # bash/sh/perl は kleaf-env.sh(fakebin)経由で /bin に置かれる前提。
++            export PATH={hermetic_base}
+             for i in {host_outs}; do
+-                {hermetic_base}/ln -s $({hermetic_base}/which $({hermetic_base}/basename $i)) $i
++                n=$({hermetic_base}/basename $i)
++                p=""
++                for d in /bin /usr/bin /run/current-system/sw/bin; do
++                    if [ -e "$d/$n" ]; then p="$d/$n"; break; fi
++                done
++                if [ -z "$p" ]; then p=$({hermetic_base}/which "$n"); fi
++                {hermetic_base}/ln -sf "$p" $i
+             done
+         """.format(
+         host_outs = " ".join([f.path for f in host_outs]),

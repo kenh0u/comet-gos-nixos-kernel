@@ -1,0 +1,31 @@
+From: kenh0u <kenh0u@users.noreply.github.com>
+Subject: [PATCH] comet-nixos: 0010 のコメント修正(free は呼び出し元経路のまま)
+
+0010(bf56569)のコメント「folio は refcount 残置で leak する」は不正確。
+filemap_unaccount_folio 自体は free をしない診断位置であり、free は
+呼び出し元(truncate 系)が引き続き行う。変更の実体は「dump の
+ratelimit 化 + mapping_exiting による見込み付き救済 free の廃止」のみ。
+挙動変更はなし(コメントのみ)。
+---
+ mm/filemap.c | 10 ++++++----
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+--- a/mm/filemap.c	2026-11-18 20:36:43.292224270 +0900
++++ b/mm/filemap.c	2026-11-18 20:36:50.278530214 +0900
+@@ -207,8 +207,12 @@
+ 		}
+ 
+ 		/*
+-		 * folio を free しない。refcount も mapcount も残す(芋づる式の
+-		 * "Bad page state" → CFI fatal 実害を避ける)。
++		 * (修正 2026-11-18) upstream と同じく free は本関数の責務ではなく
++		 * 呼び出し元(truncate 系)が行うため、本変更で folio が leak する
++		 * わけではない。変更の実体は (1) dump の ratelimit 化と (2) 上記
++		 * mapping_exiting 救済 free(page_mapcount_reset + folio_ref_sub)の
++		 * 廃止のみ。救済 free がまだ map されている folio を解放し
++		 * page state 汚染 → CFI fatal に至る事故を防ぐ。
+ 		 */
+ 	}
+ 
+
+-- 
+2.54.0

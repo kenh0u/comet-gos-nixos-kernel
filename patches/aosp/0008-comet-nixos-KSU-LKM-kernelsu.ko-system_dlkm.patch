@@ -1,0 +1,2113 @@
+From fce029c8a95338b87be1f3b089fce40bab6917b3 Mon Sep 17 00:00:00 2001
+From: kenhou <kenhou@local>
+Date: Tue, 29 Sep 2026 17:03:22 +0900
+Subject: [PATCH 08/12] =?UTF-8?q?comet-nixos:=20KSU=20LKM=20=E5=8C=96?=
+ =?UTF-8?q?=E3=81=AE=E9=85=8D=E5=82=99=E5=91=A8=E3=82=8A(kernelsu.ko=20?=
+ =?UTF-8?q?=E3=82=92=20system=5Fdlkm=20=E3=81=B8)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- modules.bzl: gki の arm64 モジュールリストに kernelsu.ko を追加
+  (=m で build した kernelsu.ko が system_dlkm.img に配属し、boot 時の
+  モジュールロード経路が確定)
+- kernel/ksu_module_exports.c: LKM で modpost が必要とした 52 symbol を
+  EXPORT_SYMBOL_GPL する専用 TU(selinux 内部含む)
+- kernel/Makefile: 同 TU を obj-y、selinux/fs/ext4 の include path 追加
+- scripts/mod/modpost.c: 未解決 symbol 表示の上限 10→200(全量取得の
+  分析用。実害なし)
+- security/selinux/include/{flask,av_permissions}.h: genheaders の生成物を
+  固定投入(gitignore 対象なので -f 追加。LKM export TU が selinux 内部
+  header を引けるようにするため)
+
+実機検証(2026-09-29): 5 点セット焼成後、Kernel Version: 32601 / lkm: true /
+late_load: true(ksud debug info)、kernelsu が system_dlkm から boot 時ロード、
+Wi-Fi(bcmdhd)+ finix コンテナ復帰 OK
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ BUILD.bazel                               |    3 +
+ kernel/Makefile                           |    4 +
+ kernel/ksu_module_exports.c               |  103 ++
+ modules.bzl                               |    3 +
+ scripts/mod/modpost.c                     |    2 +-
+ security/selinux/include/av_permissions.h | 1707 +++++++++++++++++++++
+ security/selinux/include/flask.h          |  189 +++
+ 7 files changed, 2010 insertions(+), 1 deletion(-)
+ create mode 100644 kernel/ksu_module_exports.c
+ create mode 100644 security/selinux/include/av_permissions.h
+ create mode 100644 security/selinux/include/flask.h
+
+diff --git a/BUILD.bazel b/BUILD.bazel
+index ad00f81945b88..46faa4466c4cc 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -72,6 +72,9 @@ write_file(
+     name = "gki_system_dlkm_modules_arm64",
+     out = "android/gki_system_dlkm_modules_arm64",
+     content = get_gki_modules_list("arm64") + [
++        # KernelSU を LKM 化。kernelsu.ko を system_dlkm に
++        # 配属し、boot 時の dlkm ロード経路で insmod させる。
++        "drivers/kernelsu/kernelsu.ko",
+         # Ensure new line at the end.
+         "",
+     ],
+diff --git a/kernel/Makefile b/kernel/Makefile
+index c6e7c75299296..0e60fb2f093cd 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -156,3 +156,7 @@ $(obj)/kheaders_data.tar.xz: FORCE
+ 	$(call cmd,genikh)
+ 
+ clean-files := kheaders_data.tar.xz kheaders.md5
++
++# KernelSU を LKM(=m)で使うための symbol export(LKM 化は)
++CFLAGS_ksu_module_exports.o += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include -I$(srctree)/fs/ext4
++obj-y += ksu_module_exports.o
+diff --git a/kernel/ksu_module_exports.c b/kernel/ksu_module_exports.c
+new file mode 100644
+index 0000000000000..26876b6b765cd
+--- /dev/null
++++ b/kernel/ksu_module_exports.c
+@@ -0,0 +1,103 @@
++// ksu_module_exports.c — KernelSU を LKM(=m) で使うための symbol export
++//
++// GKI 組込(CONFIG_KSU=y)時代は link 時に解決されていた KSU driver の
++// 必要 symbol を、LKM では export しておく必要がある。本ファイルで
++// EXPORT_SYMBOL_GPL する(comet 自前 GKI のみで使う。upstream では該当
++// symbol は ABI symbol list で供給される)。
++// symbol 一覧は 2026-09-29 の modpost 失敗出力から抽出。
++//
++// selinux 内部 kernel 籠器(security/selinux 配下)は公式には公開 header 無し
++// のため -I に security/selinux{,/include} と fs/ext4 を渡している。
++// ただし include/security.h 等が依存する flask.h / av_permissions.h は
++// ビルド時生成なので、genheaders(scripts/selinux/genheaders)の出力を
++// include 配下に固定投入してある(本 repo 内で再生成不要)。
++#include <linux/module.h>
++#include <linux/pid.h>
++#include <linux/cred.h>
++#include <linux/seccomp.h>
++#include <linux/mm_types.h>
++#include <linux/uaccess.h>
++#include <linux/sched/user.h>
++#include <linux/anon_inodes.h>
++#include <linux/kallsyms.h>
++#include <linux/task_work.h>
++#include <linux/syscalls.h>
++#include <linux/security.h>
++#include <linux/proc_ns.h>
++#include <trace/events/syscalls.h>
++#include <asm/cacheflush.h>
++#include <asm/fixmap.h>
++#include <linux/mount.h>
++#include <linux/fs_struct.h>
++
++// selinux 内部
++#include "ss/avtab.h"
++#include "ss/policydb.h"
++#include "ss/sidtab.h"
++#include "ss/hashtab.h"
++#include "ss/symtab.h"
++#include "avc.h"
++#include "avc_ss.h"
++#include "objsec.h"
++#include "security.h"
++#include "ext4.h"		// ext4_unregister_sysfs(-Ifs/ext4)
++
++// path_mount/path_umount は fs/internal.h(kernel 内部)にしか無い
++int path_mount(const char *dev_name, struct path *path, const char *fsname, unsigned long flags, void *data);
++int path_umount(struct path *path, int flags);
++
++// arm64 syscall wrapper(SYSCALL_DEFINE が生成る公開無し symbol)
++asmlinkage long __arm64_sys_close(const struct pt_regs *regs);
++asmlinkage long __arm64_sys_setns(const struct pt_regs *regs);
++
++EXPORT_SYMBOL_GPL(alloc_uid);
++EXPORT_SYMBOL_GPL(anon_inode_getfile_secure);
++EXPORT_SYMBOL_GPL(__arm64_sys_close);
++EXPORT_SYMBOL_GPL(__arm64_sys_setns);
++EXPORT_SYMBOL_GPL(avc_has_perm);
++EXPORT_SYMBOL_GPL(avc_ss_reset);
++EXPORT_SYMBOL_GPL(avtab_alloc);
++EXPORT_SYMBOL_GPL(avtab_destroy);
++EXPORT_SYMBOL_GPL(avtab_insert_nonunique);
++EXPORT_SYMBOL_GPL(avtab_search_node);
++EXPORT_SYMBOL_GPL(avtab_search_node_next);
++EXPORT_SYMBOL_GPL(change_pid);
++EXPORT_SYMBOL_GPL(copy_to_kernel_nofault);
++EXPORT_SYMBOL_GPL(dcache_clean_inval_poc);
++EXPORT_SYMBOL_GPL(ebitmap_get_bit);
++EXPORT_SYMBOL_GPL(ebitmap_set_bit);
++EXPORT_SYMBOL_GPL(ext4_unregister_sysfs);
++EXPORT_SYMBOL_GPL(__hashtab_insert);
++EXPORT_SYMBOL_GPL(init_mm);
++EXPORT_SYMBOL_GPL(kallsyms_lookup);
++EXPORT_SYMBOL_GPL(kallsyms_lookup_name);
++EXPORT_SYMBOL_GPL(kallsyms_lookup_size_offset);
++EXPORT_SYMBOL_GPL(kallsyms_on_each_symbol);
++EXPORT_SYMBOL_GPL(ksys_unshare);
++EXPORT_SYMBOL_GPL(mntns_operations);
++EXPORT_SYMBOL_GPL(ns_get_path);
++EXPORT_SYMBOL_GPL(path_mount);
++EXPORT_SYMBOL_GPL(path_umount);
++EXPORT_SYMBOL_GPL(policydb_destroy);
++EXPORT_SYMBOL_GPL(policydb_filenametr_search);
++EXPORT_SYMBOL_GPL(policydb_load_isids);
++EXPORT_SYMBOL_GPL(policydb_read);
++EXPORT_SYMBOL_GPL(policydb_write);
++EXPORT_SYMBOL_GPL(seccomp_filter_release);
++EXPORT_SYMBOL_GPL(set_fs_pwd);
++EXPORT_SYMBOL_GPL(security_compute_av_user);
++EXPORT_SYMBOL_GPL(security_context_str_to_sid);
++EXPORT_SYMBOL_GPL(security_context_to_sid);
++EXPORT_SYMBOL_GPL(security_sid_to_context);
++EXPORT_SYMBOL_GPL(selinux_blob_sizes);
++EXPORT_SYMBOL_GPL(selinux_state);
++EXPORT_SYMBOL_GPL(selinux_status_update_policyload);
++EXPORT_SYMBOL_GPL(selnl_notify_policyload);
++EXPORT_SYMBOL_GPL(set_cred_ucounts);
++EXPORT_SYMBOL_GPL(__set_fixmap);
++EXPORT_SYMBOL_GPL(sidtab_destroy);
++EXPORT_SYMBOL_GPL(strncpy_from_user_nofault);
++EXPORT_SYMBOL_GPL(symtab_insert);
++EXPORT_SYMBOL_GPL(symtab_search);
++EXPORT_SYMBOL_GPL(task_work_add);
++EXPORT_SYMBOL_GPL(__tracepoint_sys_enter);
+diff --git a/modules.bzl b/modules.bzl
+index 79f9858575349..f47f5753314c7 100644
+--- a/modules.bzl
++++ b/modules.bzl
+@@ -144,6 +144,9 @@ _ARM_GKI_MODULES_LIST = [
+ _ARM64_GKI_MODULES_LIST = [
+     # keep sorted
+     "arch/arm64/geniezone/gzvm.ko",
++    # KernelSU を LKM 化: GKI モジュール(system_dlkm 配属)に
++    # 追加して boot 時の dlkm ロード経路で insmod させる。
++    "drivers/kernelsu/kernelsu.ko",
+ ]
+ 
+ _RISCV64_GKI_MODULES_LIST = [
+diff --git a/scripts/mod/modpost.c b/scripts/mod/modpost.c
+index e03438c3503ae..014bde90ffc98 100644
+--- a/scripts/mod/modpost.c
++++ b/scripts/mod/modpost.c
+@@ -49,7 +49,7 @@ static bool extra_warn;
+  * Cut off the warnings when there are too many. This typically occurs when
+  * vmlinux is missing. ('make modules' without building vmlinux.)
+  */
+-#define MAX_UNRESOLVED_REPORTS	10
++#define MAX_UNRESOLVED_REPORTS	200
+ static unsigned int nr_unresolved;
+ 
+ /* In kernel, this size is defined in linux/module.h;
+diff --git a/security/selinux/include/av_permissions.h b/security/selinux/include/av_permissions.h
+new file mode 100644
+index 0000000000000..4f61c41d1f99e
+--- /dev/null
++++ b/security/selinux/include/av_permissions.h
+@@ -0,0 +1,1707 @@
++/* This file is automatically generated.  Do not edit. */
++#ifndef _SELINUX_AV_PERMISSIONS_H_
++#define _SELINUX_AV_PERMISSIONS_H_
++
++#define SECURITY__COMPUTE_AV                      0x00000001U
++#define SECURITY__COMPUTE_CREATE                  0x00000002U
++#define SECURITY__COMPUTE_MEMBER                  0x00000004U
++#define SECURITY__CHECK_CONTEXT                   0x00000008U
++#define SECURITY__LOAD_POLICY                     0x00000010U
++#define SECURITY__COMPUTE_RELABEL                 0x00000020U
++#define SECURITY__COMPUTE_USER                    0x00000040U
++#define SECURITY__SETENFORCE                      0x00000080U
++#define SECURITY__SETBOOL                         0x00000100U
++#define SECURITY__SETSECPARAM                     0x00000200U
++#define SECURITY__SETCHECKREQPROT                 0x00000400U
++#define SECURITY__READ_POLICY                     0x00000800U
++#define SECURITY__VALIDATE_TRANS                  0x00001000U
++#define PROCESS__FORK                             0x00000001U
++#define PROCESS__TRANSITION                       0x00000002U
++#define PROCESS__SIGCHLD                          0x00000004U
++#define PROCESS__SIGKILL                          0x00000008U
++#define PROCESS__SIGSTOP                          0x00000010U
++#define PROCESS__SIGNULL                          0x00000020U
++#define PROCESS__SIGNAL                           0x00000040U
++#define PROCESS__PTRACE                           0x00000080U
++#define PROCESS__GETSCHED                         0x00000100U
++#define PROCESS__SETSCHED                         0x00000200U
++#define PROCESS__GETSESSION                       0x00000400U
++#define PROCESS__GETPGID                          0x00000800U
++#define PROCESS__SETPGID                          0x00001000U
++#define PROCESS__GETCAP                           0x00002000U
++#define PROCESS__SETCAP                           0x00004000U
++#define PROCESS__SHARE                            0x00008000U
++#define PROCESS__GETATTR                          0x00010000U
++#define PROCESS__SETEXEC                          0x00020000U
++#define PROCESS__SETFSCREATE                      0x00040000U
++#define PROCESS__NOATSECURE                       0x00080000U
++#define PROCESS__SIGINH                           0x00100000U
++#define PROCESS__SETRLIMIT                        0x00200000U
++#define PROCESS__RLIMITINH                        0x00400000U
++#define PROCESS__DYNTRANSITION                    0x00800000U
++#define PROCESS__SETCURRENT                       0x01000000U
++#define PROCESS__EXECMEM                          0x02000000U
++#define PROCESS__EXECSTACK                        0x04000000U
++#define PROCESS__EXECHEAP                         0x08000000U
++#define PROCESS__SETKEYCREATE                     0x10000000U
++#define PROCESS__SETSOCKCREATE                    0x20000000U
++#define PROCESS__GETRLIMIT                        0x40000000U
++#define PROCESS2__NNP_TRANSITION                  0x00000001U
++#define PROCESS2__NOSUID_TRANSITION               0x00000002U
++#define SYSTEM__IPC_INFO                          0x00000001U
++#define SYSTEM__SYSLOG_READ                       0x00000002U
++#define SYSTEM__SYSLOG_MOD                        0x00000004U
++#define SYSTEM__SYSLOG_CONSOLE                    0x00000008U
++#define SYSTEM__MODULE_REQUEST                    0x00000010U
++#define SYSTEM__MODULE_LOAD                       0x00000020U
++#define CAPABILITY__CHOWN                         0x00000001U
++#define CAPABILITY__DAC_OVERRIDE                  0x00000002U
++#define CAPABILITY__DAC_READ_SEARCH               0x00000004U
++#define CAPABILITY__FOWNER                        0x00000008U
++#define CAPABILITY__FSETID                        0x00000010U
++#define CAPABILITY__KILL                          0x00000020U
++#define CAPABILITY__SETGID                        0x00000040U
++#define CAPABILITY__SETUID                        0x00000080U
++#define CAPABILITY__SETPCAP                       0x00000100U
++#define CAPABILITY__LINUX_IMMUTABLE               0x00000200U
++#define CAPABILITY__NET_BIND_SERVICE              0x00000400U
++#define CAPABILITY__NET_BROADCAST                 0x00000800U
++#define CAPABILITY__NET_ADMIN                     0x00001000U
++#define CAPABILITY__NET_RAW                       0x00002000U
++#define CAPABILITY__IPC_LOCK                      0x00004000U
++#define CAPABILITY__IPC_OWNER                     0x00008000U
++#define CAPABILITY__SYS_MODULE                    0x00010000U
++#define CAPABILITY__SYS_RAWIO                     0x00020000U
++#define CAPABILITY__SYS_CHROOT                    0x00040000U
++#define CAPABILITY__SYS_PTRACE                    0x00080000U
++#define CAPABILITY__SYS_PACCT                     0x00100000U
++#define CAPABILITY__SYS_ADMIN                     0x00200000U
++#define CAPABILITY__SYS_BOOT                      0x00400000U
++#define CAPABILITY__SYS_NICE                      0x00800000U
++#define CAPABILITY__SYS_RESOURCE                  0x01000000U
++#define CAPABILITY__SYS_TIME                      0x02000000U
++#define CAPABILITY__SYS_TTY_CONFIG                0x04000000U
++#define CAPABILITY__MKNOD                         0x08000000U
++#define CAPABILITY__LEASE                         0x10000000U
++#define CAPABILITY__AUDIT_WRITE                   0x20000000U
++#define CAPABILITY__AUDIT_CONTROL                 0x40000000U
++#define CAPABILITY__SETFCAP                       0x80000000U
++#define FILESYSTEM__MOUNT                         0x00000001U
++#define FILESYSTEM__REMOUNT                       0x00000002U
++#define FILESYSTEM__UNMOUNT                       0x00000004U
++#define FILESYSTEM__GETATTR                       0x00000008U
++#define FILESYSTEM__RELABELFROM                   0x00000010U
++#define FILESYSTEM__RELABELTO                     0x00000020U
++#define FILESYSTEM__ASSOCIATE                     0x00000040U
++#define FILESYSTEM__QUOTAMOD                      0x00000080U
++#define FILESYSTEM__QUOTAGET                      0x00000100U
++#define FILESYSTEM__WATCH                         0x00000200U
++#define FILE__IOCTL                               0x00000001U
++#define FILE__READ                                0x00000002U
++#define FILE__WRITE                               0x00000004U
++#define FILE__CREATE                              0x00000008U
++#define FILE__GETATTR                             0x00000010U
++#define FILE__SETATTR                             0x00000020U
++#define FILE__LOCK                                0x00000040U
++#define FILE__RELABELFROM                         0x00000080U
++#define FILE__RELABELTO                           0x00000100U
++#define FILE__APPEND                              0x00000200U
++#define FILE__MAP                                 0x00000400U
++#define FILE__UNLINK                              0x00000800U
++#define FILE__LINK                                0x00001000U
++#define FILE__RENAME                              0x00002000U
++#define FILE__EXECUTE                             0x00004000U
++#define FILE__QUOTAON                             0x00008000U
++#define FILE__MOUNTON                             0x00010000U
++#define FILE__AUDIT_ACCESS                        0x00020000U
++#define FILE__OPEN                                0x00040000U
++#define FILE__EXECMOD                             0x00080000U
++#define FILE__WATCH                               0x00100000U
++#define FILE__WATCH_MOUNT                         0x00200000U
++#define FILE__WATCH_SB                            0x00400000U
++#define FILE__WATCH_WITH_PERM                     0x00800000U
++#define FILE__WATCH_READS                         0x01000000U
++#define FILE__EXECUTE_NO_TRANS                    0x02000000U
++#define FILE__ENTRYPOINT                          0x04000000U
++#define DIR__IOCTL                                0x00000001U
++#define DIR__READ                                 0x00000002U
++#define DIR__WRITE                                0x00000004U
++#define DIR__CREATE                               0x00000008U
++#define DIR__GETATTR                              0x00000010U
++#define DIR__SETATTR                              0x00000020U
++#define DIR__LOCK                                 0x00000040U
++#define DIR__RELABELFROM                          0x00000080U
++#define DIR__RELABELTO                            0x00000100U
++#define DIR__APPEND                               0x00000200U
++#define DIR__MAP                                  0x00000400U
++#define DIR__UNLINK                               0x00000800U
++#define DIR__LINK                                 0x00001000U
++#define DIR__RENAME                               0x00002000U
++#define DIR__EXECUTE                              0x00004000U
++#define DIR__QUOTAON                              0x00008000U
++#define DIR__MOUNTON                              0x00010000U
++#define DIR__AUDIT_ACCESS                         0x00020000U
++#define DIR__OPEN                                 0x00040000U
++#define DIR__EXECMOD                              0x00080000U
++#define DIR__WATCH                                0x00100000U
++#define DIR__WATCH_MOUNT                          0x00200000U
++#define DIR__WATCH_SB                             0x00400000U
++#define DIR__WATCH_WITH_PERM                      0x00800000U
++#define DIR__WATCH_READS                          0x01000000U
++#define DIR__ADD_NAME                             0x02000000U
++#define DIR__REMOVE_NAME                          0x04000000U
++#define DIR__REPARENT                             0x08000000U
++#define DIR__SEARCH                               0x10000000U
++#define DIR__RMDIR                                0x20000000U
++#define FD__USE                                   0x00000001U
++#define LNK_FILE__IOCTL                           0x00000001U
++#define LNK_FILE__READ                            0x00000002U
++#define LNK_FILE__WRITE                           0x00000004U
++#define LNK_FILE__CREATE                          0x00000008U
++#define LNK_FILE__GETATTR                         0x00000010U
++#define LNK_FILE__SETATTR                         0x00000020U
++#define LNK_FILE__LOCK                            0x00000040U
++#define LNK_FILE__RELABELFROM                     0x00000080U
++#define LNK_FILE__RELABELTO                       0x00000100U
++#define LNK_FILE__APPEND                          0x00000200U
++#define LNK_FILE__MAP                             0x00000400U
++#define LNK_FILE__UNLINK                          0x00000800U
++#define LNK_FILE__LINK                            0x00001000U
++#define LNK_FILE__RENAME                          0x00002000U
++#define LNK_FILE__EXECUTE                         0x00004000U
++#define LNK_FILE__QUOTAON                         0x00008000U
++#define LNK_FILE__MOUNTON                         0x00010000U
++#define LNK_FILE__AUDIT_ACCESS                    0x00020000U
++#define LNK_FILE__OPEN                            0x00040000U
++#define LNK_FILE__EXECMOD                         0x00080000U
++#define LNK_FILE__WATCH                           0x00100000U
++#define LNK_FILE__WATCH_MOUNT                     0x00200000U
++#define LNK_FILE__WATCH_SB                        0x00400000U
++#define LNK_FILE__WATCH_WITH_PERM                 0x00800000U
++#define LNK_FILE__WATCH_READS                     0x01000000U
++#define CHR_FILE__IOCTL                           0x00000001U
++#define CHR_FILE__READ                            0x00000002U
++#define CHR_FILE__WRITE                           0x00000004U
++#define CHR_FILE__CREATE                          0x00000008U
++#define CHR_FILE__GETATTR                         0x00000010U
++#define CHR_FILE__SETATTR                         0x00000020U
++#define CHR_FILE__LOCK                            0x00000040U
++#define CHR_FILE__RELABELFROM                     0x00000080U
++#define CHR_FILE__RELABELTO                       0x00000100U
++#define CHR_FILE__APPEND                          0x00000200U
++#define CHR_FILE__MAP                             0x00000400U
++#define CHR_FILE__UNLINK                          0x00000800U
++#define CHR_FILE__LINK                            0x00001000U
++#define CHR_FILE__RENAME                          0x00002000U
++#define CHR_FILE__EXECUTE                         0x00004000U
++#define CHR_FILE__QUOTAON                         0x00008000U
++#define CHR_FILE__MOUNTON                         0x00010000U
++#define CHR_FILE__AUDIT_ACCESS                    0x00020000U
++#define CHR_FILE__OPEN                            0x00040000U
++#define CHR_FILE__EXECMOD                         0x00080000U
++#define CHR_FILE__WATCH                           0x00100000U
++#define CHR_FILE__WATCH_MOUNT                     0x00200000U
++#define CHR_FILE__WATCH_SB                        0x00400000U
++#define CHR_FILE__WATCH_WITH_PERM                 0x00800000U
++#define CHR_FILE__WATCH_READS                     0x01000000U
++#define BLK_FILE__IOCTL                           0x00000001U
++#define BLK_FILE__READ                            0x00000002U
++#define BLK_FILE__WRITE                           0x00000004U
++#define BLK_FILE__CREATE                          0x00000008U
++#define BLK_FILE__GETATTR                         0x00000010U
++#define BLK_FILE__SETATTR                         0x00000020U
++#define BLK_FILE__LOCK                            0x00000040U
++#define BLK_FILE__RELABELFROM                     0x00000080U
++#define BLK_FILE__RELABELTO                       0x00000100U
++#define BLK_FILE__APPEND                          0x00000200U
++#define BLK_FILE__MAP                             0x00000400U
++#define BLK_FILE__UNLINK                          0x00000800U
++#define BLK_FILE__LINK                            0x00001000U
++#define BLK_FILE__RENAME                          0x00002000U
++#define BLK_FILE__EXECUTE                         0x00004000U
++#define BLK_FILE__QUOTAON                         0x00008000U
++#define BLK_FILE__MOUNTON                         0x00010000U
++#define BLK_FILE__AUDIT_ACCESS                    0x00020000U
++#define BLK_FILE__OPEN                            0x00040000U
++#define BLK_FILE__EXECMOD                         0x00080000U
++#define BLK_FILE__WATCH                           0x00100000U
++#define BLK_FILE__WATCH_MOUNT                     0x00200000U
++#define BLK_FILE__WATCH_SB                        0x00400000U
++#define BLK_FILE__WATCH_WITH_PERM                 0x00800000U
++#define BLK_FILE__WATCH_READS                     0x01000000U
++#define SOCK_FILE__IOCTL                          0x00000001U
++#define SOCK_FILE__READ                           0x00000002U
++#define SOCK_FILE__WRITE                          0x00000004U
++#define SOCK_FILE__CREATE                         0x00000008U
++#define SOCK_FILE__GETATTR                        0x00000010U
++#define SOCK_FILE__SETATTR                        0x00000020U
++#define SOCK_FILE__LOCK                           0x00000040U
++#define SOCK_FILE__RELABELFROM                    0x00000080U
++#define SOCK_FILE__RELABELTO                      0x00000100U
++#define SOCK_FILE__APPEND                         0x00000200U
++#define SOCK_FILE__MAP                            0x00000400U
++#define SOCK_FILE__UNLINK                         0x00000800U
++#define SOCK_FILE__LINK                           0x00001000U
++#define SOCK_FILE__RENAME                         0x00002000U
++#define SOCK_FILE__EXECUTE                        0x00004000U
++#define SOCK_FILE__QUOTAON                        0x00008000U
++#define SOCK_FILE__MOUNTON                        0x00010000U
++#define SOCK_FILE__AUDIT_ACCESS                   0x00020000U
++#define SOCK_FILE__OPEN                           0x00040000U
++#define SOCK_FILE__EXECMOD                        0x00080000U
++#define SOCK_FILE__WATCH                          0x00100000U
++#define SOCK_FILE__WATCH_MOUNT                    0x00200000U
++#define SOCK_FILE__WATCH_SB                       0x00400000U
++#define SOCK_FILE__WATCH_WITH_PERM                0x00800000U
++#define SOCK_FILE__WATCH_READS                    0x01000000U
++#define FIFO_FILE__IOCTL                          0x00000001U
++#define FIFO_FILE__READ                           0x00000002U
++#define FIFO_FILE__WRITE                          0x00000004U
++#define FIFO_FILE__CREATE                         0x00000008U
++#define FIFO_FILE__GETATTR                        0x00000010U
++#define FIFO_FILE__SETATTR                        0x00000020U
++#define FIFO_FILE__LOCK                           0x00000040U
++#define FIFO_FILE__RELABELFROM                    0x00000080U
++#define FIFO_FILE__RELABELTO                      0x00000100U
++#define FIFO_FILE__APPEND                         0x00000200U
++#define FIFO_FILE__MAP                            0x00000400U
++#define FIFO_FILE__UNLINK                         0x00000800U
++#define FIFO_FILE__LINK                           0x00001000U
++#define FIFO_FILE__RENAME                         0x00002000U
++#define FIFO_FILE__EXECUTE                        0x00004000U
++#define FIFO_FILE__QUOTAON                        0x00008000U
++#define FIFO_FILE__MOUNTON                        0x00010000U
++#define FIFO_FILE__AUDIT_ACCESS                   0x00020000U
++#define FIFO_FILE__OPEN                           0x00040000U
++#define FIFO_FILE__EXECMOD                        0x00080000U
++#define FIFO_FILE__WATCH                          0x00100000U
++#define FIFO_FILE__WATCH_MOUNT                    0x00200000U
++#define FIFO_FILE__WATCH_SB                       0x00400000U
++#define FIFO_FILE__WATCH_WITH_PERM                0x00800000U
++#define FIFO_FILE__WATCH_READS                    0x01000000U
++#define SOCKET__IOCTL                             0x00000001U
++#define SOCKET__READ                              0x00000002U
++#define SOCKET__WRITE                             0x00000004U
++#define SOCKET__CREATE                            0x00000008U
++#define SOCKET__GETATTR                           0x00000010U
++#define SOCKET__SETATTR                           0x00000020U
++#define SOCKET__LOCK                              0x00000040U
++#define SOCKET__RELABELFROM                       0x00000080U
++#define SOCKET__RELABELTO                         0x00000100U
++#define SOCKET__APPEND                            0x00000200U
++#define SOCKET__MAP                               0x00000400U
++#define SOCKET__BIND                              0x00000800U
++#define SOCKET__CONNECT                           0x00001000U
++#define SOCKET__LISTEN                            0x00002000U
++#define SOCKET__ACCEPT                            0x00004000U
++#define SOCKET__GETOPT                            0x00008000U
++#define SOCKET__SETOPT                            0x00010000U
++#define SOCKET__SHUTDOWN                          0x00020000U
++#define SOCKET__RECVFROM                          0x00040000U
++#define SOCKET__SENDTO                            0x00080000U
++#define SOCKET__NAME_BIND                         0x00100000U
++#define TCP_SOCKET__IOCTL                         0x00000001U
++#define TCP_SOCKET__READ                          0x00000002U
++#define TCP_SOCKET__WRITE                         0x00000004U
++#define TCP_SOCKET__CREATE                        0x00000008U
++#define TCP_SOCKET__GETATTR                       0x00000010U
++#define TCP_SOCKET__SETATTR                       0x00000020U
++#define TCP_SOCKET__LOCK                          0x00000040U
++#define TCP_SOCKET__RELABELFROM                   0x00000080U
++#define TCP_SOCKET__RELABELTO                     0x00000100U
++#define TCP_SOCKET__APPEND                        0x00000200U
++#define TCP_SOCKET__MAP                           0x00000400U
++#define TCP_SOCKET__BIND                          0x00000800U
++#define TCP_SOCKET__CONNECT                       0x00001000U
++#define TCP_SOCKET__LISTEN                        0x00002000U
++#define TCP_SOCKET__ACCEPT                        0x00004000U
++#define TCP_SOCKET__GETOPT                        0x00008000U
++#define TCP_SOCKET__SETOPT                        0x00010000U
++#define TCP_SOCKET__SHUTDOWN                      0x00020000U
++#define TCP_SOCKET__RECVFROM                      0x00040000U
++#define TCP_SOCKET__SENDTO                        0x00080000U
++#define TCP_SOCKET__NAME_BIND                     0x00100000U
++#define TCP_SOCKET__NODE_BIND                     0x00200000U
++#define TCP_SOCKET__NAME_CONNECT                  0x00400000U
++#define UDP_SOCKET__IOCTL                         0x00000001U
++#define UDP_SOCKET__READ                          0x00000002U
++#define UDP_SOCKET__WRITE                         0x00000004U
++#define UDP_SOCKET__CREATE                        0x00000008U
++#define UDP_SOCKET__GETATTR                       0x00000010U
++#define UDP_SOCKET__SETATTR                       0x00000020U
++#define UDP_SOCKET__LOCK                          0x00000040U
++#define UDP_SOCKET__RELABELFROM                   0x00000080U
++#define UDP_SOCKET__RELABELTO                     0x00000100U
++#define UDP_SOCKET__APPEND                        0x00000200U
++#define UDP_SOCKET__MAP                           0x00000400U
++#define UDP_SOCKET__BIND                          0x00000800U
++#define UDP_SOCKET__CONNECT                       0x00001000U
++#define UDP_SOCKET__LISTEN                        0x00002000U
++#define UDP_SOCKET__ACCEPT                        0x00004000U
++#define UDP_SOCKET__GETOPT                        0x00008000U
++#define UDP_SOCKET__SETOPT                        0x00010000U
++#define UDP_SOCKET__SHUTDOWN                      0x00020000U
++#define UDP_SOCKET__RECVFROM                      0x00040000U
++#define UDP_SOCKET__SENDTO                        0x00080000U
++#define UDP_SOCKET__NAME_BIND                     0x00100000U
++#define UDP_SOCKET__NODE_BIND                     0x00200000U
++#define RAWIP_SOCKET__IOCTL                       0x00000001U
++#define RAWIP_SOCKET__READ                        0x00000002U
++#define RAWIP_SOCKET__WRITE                       0x00000004U
++#define RAWIP_SOCKET__CREATE                      0x00000008U
++#define RAWIP_SOCKET__GETATTR                     0x00000010U
++#define RAWIP_SOCKET__SETATTR                     0x00000020U
++#define RAWIP_SOCKET__LOCK                        0x00000040U
++#define RAWIP_SOCKET__RELABELFROM                 0x00000080U
++#define RAWIP_SOCKET__RELABELTO                   0x00000100U
++#define RAWIP_SOCKET__APPEND                      0x00000200U
++#define RAWIP_SOCKET__MAP                         0x00000400U
++#define RAWIP_SOCKET__BIND                        0x00000800U
++#define RAWIP_SOCKET__CONNECT                     0x00001000U
++#define RAWIP_SOCKET__LISTEN                      0x00002000U
++#define RAWIP_SOCKET__ACCEPT                      0x00004000U
++#define RAWIP_SOCKET__GETOPT                      0x00008000U
++#define RAWIP_SOCKET__SETOPT                      0x00010000U
++#define RAWIP_SOCKET__SHUTDOWN                    0x00020000U
++#define RAWIP_SOCKET__RECVFROM                    0x00040000U
++#define RAWIP_SOCKET__SENDTO                      0x00080000U
++#define RAWIP_SOCKET__NAME_BIND                   0x00100000U
++#define RAWIP_SOCKET__NODE_BIND                   0x00200000U
++#define NODE__RECVFROM                            0x00000001U
++#define NODE__SENDTO                              0x00000002U
++#define NETIF__INGRESS                            0x00000001U
++#define NETIF__EGRESS                             0x00000002U
++#define NETLINK_SOCKET__IOCTL                     0x00000001U
++#define NETLINK_SOCKET__READ                      0x00000002U
++#define NETLINK_SOCKET__WRITE                     0x00000004U
++#define NETLINK_SOCKET__CREATE                    0x00000008U
++#define NETLINK_SOCKET__GETATTR                   0x00000010U
++#define NETLINK_SOCKET__SETATTR                   0x00000020U
++#define NETLINK_SOCKET__LOCK                      0x00000040U
++#define NETLINK_SOCKET__RELABELFROM               0x00000080U
++#define NETLINK_SOCKET__RELABELTO                 0x00000100U
++#define NETLINK_SOCKET__APPEND                    0x00000200U
++#define NETLINK_SOCKET__MAP                       0x00000400U
++#define NETLINK_SOCKET__BIND                      0x00000800U
++#define NETLINK_SOCKET__CONNECT                   0x00001000U
++#define NETLINK_SOCKET__LISTEN                    0x00002000U
++#define NETLINK_SOCKET__ACCEPT                    0x00004000U
++#define NETLINK_SOCKET__GETOPT                    0x00008000U
++#define NETLINK_SOCKET__SETOPT                    0x00010000U
++#define NETLINK_SOCKET__SHUTDOWN                  0x00020000U
++#define NETLINK_SOCKET__RECVFROM                  0x00040000U
++#define NETLINK_SOCKET__SENDTO                    0x00080000U
++#define NETLINK_SOCKET__NAME_BIND                 0x00100000U
++#define PACKET_SOCKET__IOCTL                      0x00000001U
++#define PACKET_SOCKET__READ                       0x00000002U
++#define PACKET_SOCKET__WRITE                      0x00000004U
++#define PACKET_SOCKET__CREATE                     0x00000008U
++#define PACKET_SOCKET__GETATTR                    0x00000010U
++#define PACKET_SOCKET__SETATTR                    0x00000020U
++#define PACKET_SOCKET__LOCK                       0x00000040U
++#define PACKET_SOCKET__RELABELFROM                0x00000080U
++#define PACKET_SOCKET__RELABELTO                  0x00000100U
++#define PACKET_SOCKET__APPEND                     0x00000200U
++#define PACKET_SOCKET__MAP                        0x00000400U
++#define PACKET_SOCKET__BIND                       0x00000800U
++#define PACKET_SOCKET__CONNECT                    0x00001000U
++#define PACKET_SOCKET__LISTEN                     0x00002000U
++#define PACKET_SOCKET__ACCEPT                     0x00004000U
++#define PACKET_SOCKET__GETOPT                     0x00008000U
++#define PACKET_SOCKET__SETOPT                     0x00010000U
++#define PACKET_SOCKET__SHUTDOWN                   0x00020000U
++#define PACKET_SOCKET__RECVFROM                   0x00040000U
++#define PACKET_SOCKET__SENDTO                     0x00080000U
++#define PACKET_SOCKET__NAME_BIND                  0x00100000U
++#define KEY_SOCKET__IOCTL                         0x00000001U
++#define KEY_SOCKET__READ                          0x00000002U
++#define KEY_SOCKET__WRITE                         0x00000004U
++#define KEY_SOCKET__CREATE                        0x00000008U
++#define KEY_SOCKET__GETATTR                       0x00000010U
++#define KEY_SOCKET__SETATTR                       0x00000020U
++#define KEY_SOCKET__LOCK                          0x00000040U
++#define KEY_SOCKET__RELABELFROM                   0x00000080U
++#define KEY_SOCKET__RELABELTO                     0x00000100U
++#define KEY_SOCKET__APPEND                        0x00000200U
++#define KEY_SOCKET__MAP                           0x00000400U
++#define KEY_SOCKET__BIND                          0x00000800U
++#define KEY_SOCKET__CONNECT                       0x00001000U
++#define KEY_SOCKET__LISTEN                        0x00002000U
++#define KEY_SOCKET__ACCEPT                        0x00004000U
++#define KEY_SOCKET__GETOPT                        0x00008000U
++#define KEY_SOCKET__SETOPT                        0x00010000U
++#define KEY_SOCKET__SHUTDOWN                      0x00020000U
++#define KEY_SOCKET__RECVFROM                      0x00040000U
++#define KEY_SOCKET__SENDTO                        0x00080000U
++#define KEY_SOCKET__NAME_BIND                     0x00100000U
++#define UNIX_STREAM_SOCKET__IOCTL                 0x00000001U
++#define UNIX_STREAM_SOCKET__READ                  0x00000002U
++#define UNIX_STREAM_SOCKET__WRITE                 0x00000004U
++#define UNIX_STREAM_SOCKET__CREATE                0x00000008U
++#define UNIX_STREAM_SOCKET__GETATTR               0x00000010U
++#define UNIX_STREAM_SOCKET__SETATTR               0x00000020U
++#define UNIX_STREAM_SOCKET__LOCK                  0x00000040U
++#define UNIX_STREAM_SOCKET__RELABELFROM           0x00000080U
++#define UNIX_STREAM_SOCKET__RELABELTO             0x00000100U
++#define UNIX_STREAM_SOCKET__APPEND                0x00000200U
++#define UNIX_STREAM_SOCKET__MAP                   0x00000400U
++#define UNIX_STREAM_SOCKET__BIND                  0x00000800U
++#define UNIX_STREAM_SOCKET__CONNECT               0x00001000U
++#define UNIX_STREAM_SOCKET__LISTEN                0x00002000U
++#define UNIX_STREAM_SOCKET__ACCEPT                0x00004000U
++#define UNIX_STREAM_SOCKET__GETOPT                0x00008000U
++#define UNIX_STREAM_SOCKET__SETOPT                0x00010000U
++#define UNIX_STREAM_SOCKET__SHUTDOWN              0x00020000U
++#define UNIX_STREAM_SOCKET__RECVFROM              0x00040000U
++#define UNIX_STREAM_SOCKET__SENDTO                0x00080000U
++#define UNIX_STREAM_SOCKET__NAME_BIND             0x00100000U
++#define UNIX_STREAM_SOCKET__CONNECTTO             0x00200000U
++#define UNIX_DGRAM_SOCKET__IOCTL                  0x00000001U
++#define UNIX_DGRAM_SOCKET__READ                   0x00000002U
++#define UNIX_DGRAM_SOCKET__WRITE                  0x00000004U
++#define UNIX_DGRAM_SOCKET__CREATE                 0x00000008U
++#define UNIX_DGRAM_SOCKET__GETATTR                0x00000010U
++#define UNIX_DGRAM_SOCKET__SETATTR                0x00000020U
++#define UNIX_DGRAM_SOCKET__LOCK                   0x00000040U
++#define UNIX_DGRAM_SOCKET__RELABELFROM            0x00000080U
++#define UNIX_DGRAM_SOCKET__RELABELTO              0x00000100U
++#define UNIX_DGRAM_SOCKET__APPEND                 0x00000200U
++#define UNIX_DGRAM_SOCKET__MAP                    0x00000400U
++#define UNIX_DGRAM_SOCKET__BIND                   0x00000800U
++#define UNIX_DGRAM_SOCKET__CONNECT                0x00001000U
++#define UNIX_DGRAM_SOCKET__LISTEN                 0x00002000U
++#define UNIX_DGRAM_SOCKET__ACCEPT                 0x00004000U
++#define UNIX_DGRAM_SOCKET__GETOPT                 0x00008000U
++#define UNIX_DGRAM_SOCKET__SETOPT                 0x00010000U
++#define UNIX_DGRAM_SOCKET__SHUTDOWN               0x00020000U
++#define UNIX_DGRAM_SOCKET__RECVFROM               0x00040000U
++#define UNIX_DGRAM_SOCKET__SENDTO                 0x00080000U
++#define UNIX_DGRAM_SOCKET__NAME_BIND              0x00100000U
++#define SEM__CREATE                               0x00000001U
++#define SEM__DESTROY                              0x00000002U
++#define SEM__GETATTR                              0x00000004U
++#define SEM__SETATTR                              0x00000008U
++#define SEM__READ                                 0x00000010U
++#define SEM__WRITE                                0x00000020U
++#define SEM__ASSOCIATE                            0x00000040U
++#define SEM__UNIX_READ                            0x00000080U
++#define SEM__UNIX_WRITE                           0x00000100U
++#define MSG__SEND                                 0x00000001U
++#define MSG__RECEIVE                              0x00000002U
++#define MSGQ__CREATE                              0x00000001U
++#define MSGQ__DESTROY                             0x00000002U
++#define MSGQ__GETATTR                             0x00000004U
++#define MSGQ__SETATTR                             0x00000008U
++#define MSGQ__READ                                0x00000010U
++#define MSGQ__WRITE                               0x00000020U
++#define MSGQ__ASSOCIATE                           0x00000040U
++#define MSGQ__UNIX_READ                           0x00000080U
++#define MSGQ__UNIX_WRITE                          0x00000100U
++#define MSGQ__ENQUEUE                             0x00000200U
++#define SHM__CREATE                               0x00000001U
++#define SHM__DESTROY                              0x00000002U
++#define SHM__GETATTR                              0x00000004U
++#define SHM__SETATTR                              0x00000008U
++#define SHM__READ                                 0x00000010U
++#define SHM__WRITE                                0x00000020U
++#define SHM__ASSOCIATE                            0x00000040U
++#define SHM__UNIX_READ                            0x00000080U
++#define SHM__UNIX_WRITE                           0x00000100U
++#define SHM__LOCK                                 0x00000200U
++#define IPC__CREATE                               0x00000001U
++#define IPC__DESTROY                              0x00000002U
++#define IPC__GETATTR                              0x00000004U
++#define IPC__SETATTR                              0x00000008U
++#define IPC__READ                                 0x00000010U
++#define IPC__WRITE                                0x00000020U
++#define IPC__ASSOCIATE                            0x00000040U
++#define IPC__UNIX_READ                            0x00000080U
++#define IPC__UNIX_WRITE                           0x00000100U
++#define NETLINK_ROUTE_SOCKET__IOCTL               0x00000001U
++#define NETLINK_ROUTE_SOCKET__READ                0x00000002U
++#define NETLINK_ROUTE_SOCKET__WRITE               0x00000004U
++#define NETLINK_ROUTE_SOCKET__CREATE              0x00000008U
++#define NETLINK_ROUTE_SOCKET__GETATTR             0x00000010U
++#define NETLINK_ROUTE_SOCKET__SETATTR             0x00000020U
++#define NETLINK_ROUTE_SOCKET__LOCK                0x00000040U
++#define NETLINK_ROUTE_SOCKET__RELABELFROM         0x00000080U
++#define NETLINK_ROUTE_SOCKET__RELABELTO           0x00000100U
++#define NETLINK_ROUTE_SOCKET__APPEND              0x00000200U
++#define NETLINK_ROUTE_SOCKET__MAP                 0x00000400U
++#define NETLINK_ROUTE_SOCKET__BIND                0x00000800U
++#define NETLINK_ROUTE_SOCKET__CONNECT             0x00001000U
++#define NETLINK_ROUTE_SOCKET__LISTEN              0x00002000U
++#define NETLINK_ROUTE_SOCKET__ACCEPT              0x00004000U
++#define NETLINK_ROUTE_SOCKET__GETOPT              0x00008000U
++#define NETLINK_ROUTE_SOCKET__SETOPT              0x00010000U
++#define NETLINK_ROUTE_SOCKET__SHUTDOWN            0x00020000U
++#define NETLINK_ROUTE_SOCKET__RECVFROM            0x00040000U
++#define NETLINK_ROUTE_SOCKET__SENDTO              0x00080000U
++#define NETLINK_ROUTE_SOCKET__NAME_BIND           0x00100000U
++#define NETLINK_ROUTE_SOCKET__NLMSG_READ          0x00200000U
++#define NETLINK_ROUTE_SOCKET__NLMSG_WRITE         0x00400000U
++#define NETLINK_ROUTE_SOCKET__NLMSG_READPRIV      0x00800000U
++#define NETLINK_ROUTE_SOCKET__NLMSG_GETNEIGH      0x01000000U
++#define NETLINK_TCPDIAG_SOCKET__IOCTL             0x00000001U
++#define NETLINK_TCPDIAG_SOCKET__READ              0x00000002U
++#define NETLINK_TCPDIAG_SOCKET__WRITE             0x00000004U
++#define NETLINK_TCPDIAG_SOCKET__CREATE            0x00000008U
++#define NETLINK_TCPDIAG_SOCKET__GETATTR           0x00000010U
++#define NETLINK_TCPDIAG_SOCKET__SETATTR           0x00000020U
++#define NETLINK_TCPDIAG_SOCKET__LOCK              0x00000040U
++#define NETLINK_TCPDIAG_SOCKET__RELABELFROM       0x00000080U
++#define NETLINK_TCPDIAG_SOCKET__RELABELTO         0x00000100U
++#define NETLINK_TCPDIAG_SOCKET__APPEND            0x00000200U
++#define NETLINK_TCPDIAG_SOCKET__MAP               0x00000400U
++#define NETLINK_TCPDIAG_SOCKET__BIND              0x00000800U
++#define NETLINK_TCPDIAG_SOCKET__CONNECT           0x00001000U
++#define NETLINK_TCPDIAG_SOCKET__LISTEN            0x00002000U
++#define NETLINK_TCPDIAG_SOCKET__ACCEPT            0x00004000U
++#define NETLINK_TCPDIAG_SOCKET__GETOPT            0x00008000U
++#define NETLINK_TCPDIAG_SOCKET__SETOPT            0x00010000U
++#define NETLINK_TCPDIAG_SOCKET__SHUTDOWN          0x00020000U
++#define NETLINK_TCPDIAG_SOCKET__RECVFROM          0x00040000U
++#define NETLINK_TCPDIAG_SOCKET__SENDTO            0x00080000U
++#define NETLINK_TCPDIAG_SOCKET__NAME_BIND         0x00100000U
++#define NETLINK_TCPDIAG_SOCKET__NLMSG_READ        0x00200000U
++#define NETLINK_TCPDIAG_SOCKET__NLMSG_WRITE       0x00400000U
++#define NETLINK_NFLOG_SOCKET__IOCTL               0x00000001U
++#define NETLINK_NFLOG_SOCKET__READ                0x00000002U
++#define NETLINK_NFLOG_SOCKET__WRITE               0x00000004U
++#define NETLINK_NFLOG_SOCKET__CREATE              0x00000008U
++#define NETLINK_NFLOG_SOCKET__GETATTR             0x00000010U
++#define NETLINK_NFLOG_SOCKET__SETATTR             0x00000020U
++#define NETLINK_NFLOG_SOCKET__LOCK                0x00000040U
++#define NETLINK_NFLOG_SOCKET__RELABELFROM         0x00000080U
++#define NETLINK_NFLOG_SOCKET__RELABELTO           0x00000100U
++#define NETLINK_NFLOG_SOCKET__APPEND              0x00000200U
++#define NETLINK_NFLOG_SOCKET__MAP                 0x00000400U
++#define NETLINK_NFLOG_SOCKET__BIND                0x00000800U
++#define NETLINK_NFLOG_SOCKET__CONNECT             0x00001000U
++#define NETLINK_NFLOG_SOCKET__LISTEN              0x00002000U
++#define NETLINK_NFLOG_SOCKET__ACCEPT              0x00004000U
++#define NETLINK_NFLOG_SOCKET__GETOPT              0x00008000U
++#define NETLINK_NFLOG_SOCKET__SETOPT              0x00010000U
++#define NETLINK_NFLOG_SOCKET__SHUTDOWN            0x00020000U
++#define NETLINK_NFLOG_SOCKET__RECVFROM            0x00040000U
++#define NETLINK_NFLOG_SOCKET__SENDTO              0x00080000U
++#define NETLINK_NFLOG_SOCKET__NAME_BIND           0x00100000U
++#define NETLINK_XFRM_SOCKET__IOCTL                0x00000001U
++#define NETLINK_XFRM_SOCKET__READ                 0x00000002U
++#define NETLINK_XFRM_SOCKET__WRITE                0x00000004U
++#define NETLINK_XFRM_SOCKET__CREATE               0x00000008U
++#define NETLINK_XFRM_SOCKET__GETATTR              0x00000010U
++#define NETLINK_XFRM_SOCKET__SETATTR              0x00000020U
++#define NETLINK_XFRM_SOCKET__LOCK                 0x00000040U
++#define NETLINK_XFRM_SOCKET__RELABELFROM          0x00000080U
++#define NETLINK_XFRM_SOCKET__RELABELTO            0x00000100U
++#define NETLINK_XFRM_SOCKET__APPEND               0x00000200U
++#define NETLINK_XFRM_SOCKET__MAP                  0x00000400U
++#define NETLINK_XFRM_SOCKET__BIND                 0x00000800U
++#define NETLINK_XFRM_SOCKET__CONNECT              0x00001000U
++#define NETLINK_XFRM_SOCKET__LISTEN               0x00002000U
++#define NETLINK_XFRM_SOCKET__ACCEPT               0x00004000U
++#define NETLINK_XFRM_SOCKET__GETOPT               0x00008000U
++#define NETLINK_XFRM_SOCKET__SETOPT               0x00010000U
++#define NETLINK_XFRM_SOCKET__SHUTDOWN             0x00020000U
++#define NETLINK_XFRM_SOCKET__RECVFROM             0x00040000U
++#define NETLINK_XFRM_SOCKET__SENDTO               0x00080000U
++#define NETLINK_XFRM_SOCKET__NAME_BIND            0x00100000U
++#define NETLINK_XFRM_SOCKET__NLMSG_READ           0x00200000U
++#define NETLINK_XFRM_SOCKET__NLMSG_WRITE          0x00400000U
++#define NETLINK_SELINUX_SOCKET__IOCTL             0x00000001U
++#define NETLINK_SELINUX_SOCKET__READ              0x00000002U
++#define NETLINK_SELINUX_SOCKET__WRITE             0x00000004U
++#define NETLINK_SELINUX_SOCKET__CREATE            0x00000008U
++#define NETLINK_SELINUX_SOCKET__GETATTR           0x00000010U
++#define NETLINK_SELINUX_SOCKET__SETATTR           0x00000020U
++#define NETLINK_SELINUX_SOCKET__LOCK              0x00000040U
++#define NETLINK_SELINUX_SOCKET__RELABELFROM       0x00000080U
++#define NETLINK_SELINUX_SOCKET__RELABELTO         0x00000100U
++#define NETLINK_SELINUX_SOCKET__APPEND            0x00000200U
++#define NETLINK_SELINUX_SOCKET__MAP               0x00000400U
++#define NETLINK_SELINUX_SOCKET__BIND              0x00000800U
++#define NETLINK_SELINUX_SOCKET__CONNECT           0x00001000U
++#define NETLINK_SELINUX_SOCKET__LISTEN            0x00002000U
++#define NETLINK_SELINUX_SOCKET__ACCEPT            0x00004000U
++#define NETLINK_SELINUX_SOCKET__GETOPT            0x00008000U
++#define NETLINK_SELINUX_SOCKET__SETOPT            0x00010000U
++#define NETLINK_SELINUX_SOCKET__SHUTDOWN          0x00020000U
++#define NETLINK_SELINUX_SOCKET__RECVFROM          0x00040000U
++#define NETLINK_SELINUX_SOCKET__SENDTO            0x00080000U
++#define NETLINK_SELINUX_SOCKET__NAME_BIND         0x00100000U
++#define NETLINK_ISCSI_SOCKET__IOCTL               0x00000001U
++#define NETLINK_ISCSI_SOCKET__READ                0x00000002U
++#define NETLINK_ISCSI_SOCKET__WRITE               0x00000004U
++#define NETLINK_ISCSI_SOCKET__CREATE              0x00000008U
++#define NETLINK_ISCSI_SOCKET__GETATTR             0x00000010U
++#define NETLINK_ISCSI_SOCKET__SETATTR             0x00000020U
++#define NETLINK_ISCSI_SOCKET__LOCK                0x00000040U
++#define NETLINK_ISCSI_SOCKET__RELABELFROM         0x00000080U
++#define NETLINK_ISCSI_SOCKET__RELABELTO           0x00000100U
++#define NETLINK_ISCSI_SOCKET__APPEND              0x00000200U
++#define NETLINK_ISCSI_SOCKET__MAP                 0x00000400U
++#define NETLINK_ISCSI_SOCKET__BIND                0x00000800U
++#define NETLINK_ISCSI_SOCKET__CONNECT             0x00001000U
++#define NETLINK_ISCSI_SOCKET__LISTEN              0x00002000U
++#define NETLINK_ISCSI_SOCKET__ACCEPT              0x00004000U
++#define NETLINK_ISCSI_SOCKET__GETOPT              0x00008000U
++#define NETLINK_ISCSI_SOCKET__SETOPT              0x00010000U
++#define NETLINK_ISCSI_SOCKET__SHUTDOWN            0x00020000U
++#define NETLINK_ISCSI_SOCKET__RECVFROM            0x00040000U
++#define NETLINK_ISCSI_SOCKET__SENDTO              0x00080000U
++#define NETLINK_ISCSI_SOCKET__NAME_BIND           0x00100000U
++#define NETLINK_AUDIT_SOCKET__IOCTL               0x00000001U
++#define NETLINK_AUDIT_SOCKET__READ                0x00000002U
++#define NETLINK_AUDIT_SOCKET__WRITE               0x00000004U
++#define NETLINK_AUDIT_SOCKET__CREATE              0x00000008U
++#define NETLINK_AUDIT_SOCKET__GETATTR             0x00000010U
++#define NETLINK_AUDIT_SOCKET__SETATTR             0x00000020U
++#define NETLINK_AUDIT_SOCKET__LOCK                0x00000040U
++#define NETLINK_AUDIT_SOCKET__RELABELFROM         0x00000080U
++#define NETLINK_AUDIT_SOCKET__RELABELTO           0x00000100U
++#define NETLINK_AUDIT_SOCKET__APPEND              0x00000200U
++#define NETLINK_AUDIT_SOCKET__MAP                 0x00000400U
++#define NETLINK_AUDIT_SOCKET__BIND                0x00000800U
++#define NETLINK_AUDIT_SOCKET__CONNECT             0x00001000U
++#define NETLINK_AUDIT_SOCKET__LISTEN              0x00002000U
++#define NETLINK_AUDIT_SOCKET__ACCEPT              0x00004000U
++#define NETLINK_AUDIT_SOCKET__GETOPT              0x00008000U
++#define NETLINK_AUDIT_SOCKET__SETOPT              0x00010000U
++#define NETLINK_AUDIT_SOCKET__SHUTDOWN            0x00020000U
++#define NETLINK_AUDIT_SOCKET__RECVFROM            0x00040000U
++#define NETLINK_AUDIT_SOCKET__SENDTO              0x00080000U
++#define NETLINK_AUDIT_SOCKET__NAME_BIND           0x00100000U
++#define NETLINK_AUDIT_SOCKET__NLMSG_READ          0x00200000U
++#define NETLINK_AUDIT_SOCKET__NLMSG_WRITE         0x00400000U
++#define NETLINK_AUDIT_SOCKET__NLMSG_RELAY         0x00800000U
++#define NETLINK_AUDIT_SOCKET__NLMSG_READPRIV      0x01000000U
++#define NETLINK_AUDIT_SOCKET__NLMSG_TTY_AUDIT     0x02000000U
++#define NETLINK_FIB_LOOKUP_SOCKET__IOCTL          0x00000001U
++#define NETLINK_FIB_LOOKUP_SOCKET__READ           0x00000002U
++#define NETLINK_FIB_LOOKUP_SOCKET__WRITE          0x00000004U
++#define NETLINK_FIB_LOOKUP_SOCKET__CREATE         0x00000008U
++#define NETLINK_FIB_LOOKUP_SOCKET__GETATTR        0x00000010U
++#define NETLINK_FIB_LOOKUP_SOCKET__SETATTR        0x00000020U
++#define NETLINK_FIB_LOOKUP_SOCKET__LOCK           0x00000040U
++#define NETLINK_FIB_LOOKUP_SOCKET__RELABELFROM    0x00000080U
++#define NETLINK_FIB_LOOKUP_SOCKET__RELABELTO      0x00000100U
++#define NETLINK_FIB_LOOKUP_SOCKET__APPEND         0x00000200U
++#define NETLINK_FIB_LOOKUP_SOCKET__MAP            0x00000400U
++#define NETLINK_FIB_LOOKUP_SOCKET__BIND           0x00000800U
++#define NETLINK_FIB_LOOKUP_SOCKET__CONNECT        0x00001000U
++#define NETLINK_FIB_LOOKUP_SOCKET__LISTEN         0x00002000U
++#define NETLINK_FIB_LOOKUP_SOCKET__ACCEPT         0x00004000U
++#define NETLINK_FIB_LOOKUP_SOCKET__GETOPT         0x00008000U
++#define NETLINK_FIB_LOOKUP_SOCKET__SETOPT         0x00010000U
++#define NETLINK_FIB_LOOKUP_SOCKET__SHUTDOWN       0x00020000U
++#define NETLINK_FIB_LOOKUP_SOCKET__RECVFROM       0x00040000U
++#define NETLINK_FIB_LOOKUP_SOCKET__SENDTO         0x00080000U
++#define NETLINK_FIB_LOOKUP_SOCKET__NAME_BIND      0x00100000U
++#define NETLINK_CONNECTOR_SOCKET__IOCTL           0x00000001U
++#define NETLINK_CONNECTOR_SOCKET__READ            0x00000002U
++#define NETLINK_CONNECTOR_SOCKET__WRITE           0x00000004U
++#define NETLINK_CONNECTOR_SOCKET__CREATE          0x00000008U
++#define NETLINK_CONNECTOR_SOCKET__GETATTR         0x00000010U
++#define NETLINK_CONNECTOR_SOCKET__SETATTR         0x00000020U
++#define NETLINK_CONNECTOR_SOCKET__LOCK            0x00000040U
++#define NETLINK_CONNECTOR_SOCKET__RELABELFROM     0x00000080U
++#define NETLINK_CONNECTOR_SOCKET__RELABELTO       0x00000100U
++#define NETLINK_CONNECTOR_SOCKET__APPEND          0x00000200U
++#define NETLINK_CONNECTOR_SOCKET__MAP             0x00000400U
++#define NETLINK_CONNECTOR_SOCKET__BIND            0x00000800U
++#define NETLINK_CONNECTOR_SOCKET__CONNECT         0x00001000U
++#define NETLINK_CONNECTOR_SOCKET__LISTEN          0x00002000U
++#define NETLINK_CONNECTOR_SOCKET__ACCEPT          0x00004000U
++#define NETLINK_CONNECTOR_SOCKET__GETOPT          0x00008000U
++#define NETLINK_CONNECTOR_SOCKET__SETOPT          0x00010000U
++#define NETLINK_CONNECTOR_SOCKET__SHUTDOWN        0x00020000U
++#define NETLINK_CONNECTOR_SOCKET__RECVFROM        0x00040000U
++#define NETLINK_CONNECTOR_SOCKET__SENDTO          0x00080000U
++#define NETLINK_CONNECTOR_SOCKET__NAME_BIND       0x00100000U
++#define NETLINK_NETFILTER_SOCKET__IOCTL           0x00000001U
++#define NETLINK_NETFILTER_SOCKET__READ            0x00000002U
++#define NETLINK_NETFILTER_SOCKET__WRITE           0x00000004U
++#define NETLINK_NETFILTER_SOCKET__CREATE          0x00000008U
++#define NETLINK_NETFILTER_SOCKET__GETATTR         0x00000010U
++#define NETLINK_NETFILTER_SOCKET__SETATTR         0x00000020U
++#define NETLINK_NETFILTER_SOCKET__LOCK            0x00000040U
++#define NETLINK_NETFILTER_SOCKET__RELABELFROM     0x00000080U
++#define NETLINK_NETFILTER_SOCKET__RELABELTO       0x00000100U
++#define NETLINK_NETFILTER_SOCKET__APPEND          0x00000200U
++#define NETLINK_NETFILTER_SOCKET__MAP             0x00000400U
++#define NETLINK_NETFILTER_SOCKET__BIND            0x00000800U
++#define NETLINK_NETFILTER_SOCKET__CONNECT         0x00001000U
++#define NETLINK_NETFILTER_SOCKET__LISTEN          0x00002000U
++#define NETLINK_NETFILTER_SOCKET__ACCEPT          0x00004000U
++#define NETLINK_NETFILTER_SOCKET__GETOPT          0x00008000U
++#define NETLINK_NETFILTER_SOCKET__SETOPT          0x00010000U
++#define NETLINK_NETFILTER_SOCKET__SHUTDOWN        0x00020000U
++#define NETLINK_NETFILTER_SOCKET__RECVFROM        0x00040000U
++#define NETLINK_NETFILTER_SOCKET__SENDTO          0x00080000U
++#define NETLINK_NETFILTER_SOCKET__NAME_BIND       0x00100000U
++#define NETLINK_DNRT_SOCKET__IOCTL                0x00000001U
++#define NETLINK_DNRT_SOCKET__READ                 0x00000002U
++#define NETLINK_DNRT_SOCKET__WRITE                0x00000004U
++#define NETLINK_DNRT_SOCKET__CREATE               0x00000008U
++#define NETLINK_DNRT_SOCKET__GETATTR              0x00000010U
++#define NETLINK_DNRT_SOCKET__SETATTR              0x00000020U
++#define NETLINK_DNRT_SOCKET__LOCK                 0x00000040U
++#define NETLINK_DNRT_SOCKET__RELABELFROM          0x00000080U
++#define NETLINK_DNRT_SOCKET__RELABELTO            0x00000100U
++#define NETLINK_DNRT_SOCKET__APPEND               0x00000200U
++#define NETLINK_DNRT_SOCKET__MAP                  0x00000400U
++#define NETLINK_DNRT_SOCKET__BIND                 0x00000800U
++#define NETLINK_DNRT_SOCKET__CONNECT              0x00001000U
++#define NETLINK_DNRT_SOCKET__LISTEN               0x00002000U
++#define NETLINK_DNRT_SOCKET__ACCEPT               0x00004000U
++#define NETLINK_DNRT_SOCKET__GETOPT               0x00008000U
++#define NETLINK_DNRT_SOCKET__SETOPT               0x00010000U
++#define NETLINK_DNRT_SOCKET__SHUTDOWN             0x00020000U
++#define NETLINK_DNRT_SOCKET__RECVFROM             0x00040000U
++#define NETLINK_DNRT_SOCKET__SENDTO               0x00080000U
++#define NETLINK_DNRT_SOCKET__NAME_BIND            0x00100000U
++#define ASSOCIATION__SENDTO                       0x00000001U
++#define ASSOCIATION__RECVFROM                     0x00000002U
++#define ASSOCIATION__SETCONTEXT                   0x00000004U
++#define ASSOCIATION__POLMATCH                     0x00000008U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__IOCTL      0x00000001U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__READ       0x00000002U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__WRITE      0x00000004U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__CREATE     0x00000008U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__GETATTR    0x00000010U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__SETATTR    0x00000020U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__LOCK       0x00000040U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__RELABELFROM 0x00000080U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__RELABELTO  0x00000100U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__APPEND     0x00000200U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__MAP        0x00000400U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__BIND       0x00000800U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__CONNECT    0x00001000U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__LISTEN     0x00002000U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__ACCEPT     0x00004000U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__GETOPT     0x00008000U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__SETOPT     0x00010000U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__SHUTDOWN   0x00020000U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__RECVFROM   0x00040000U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__SENDTO     0x00080000U
++#define NETLINK_KOBJECT_UEVENT_SOCKET__NAME_BIND  0x00100000U
++#define NETLINK_GENERIC_SOCKET__IOCTL             0x00000001U
++#define NETLINK_GENERIC_SOCKET__READ              0x00000002U
++#define NETLINK_GENERIC_SOCKET__WRITE             0x00000004U
++#define NETLINK_GENERIC_SOCKET__CREATE            0x00000008U
++#define NETLINK_GENERIC_SOCKET__GETATTR           0x00000010U
++#define NETLINK_GENERIC_SOCKET__SETATTR           0x00000020U
++#define NETLINK_GENERIC_SOCKET__LOCK              0x00000040U
++#define NETLINK_GENERIC_SOCKET__RELABELFROM       0x00000080U
++#define NETLINK_GENERIC_SOCKET__RELABELTO         0x00000100U
++#define NETLINK_GENERIC_SOCKET__APPEND            0x00000200U
++#define NETLINK_GENERIC_SOCKET__MAP               0x00000400U
++#define NETLINK_GENERIC_SOCKET__BIND              0x00000800U
++#define NETLINK_GENERIC_SOCKET__CONNECT           0x00001000U
++#define NETLINK_GENERIC_SOCKET__LISTEN            0x00002000U
++#define NETLINK_GENERIC_SOCKET__ACCEPT            0x00004000U
++#define NETLINK_GENERIC_SOCKET__GETOPT            0x00008000U
++#define NETLINK_GENERIC_SOCKET__SETOPT            0x00010000U
++#define NETLINK_GENERIC_SOCKET__SHUTDOWN          0x00020000U
++#define NETLINK_GENERIC_SOCKET__RECVFROM          0x00040000U
++#define NETLINK_GENERIC_SOCKET__SENDTO            0x00080000U
++#define NETLINK_GENERIC_SOCKET__NAME_BIND         0x00100000U
++#define NETLINK_SCSITRANSPORT_SOCKET__IOCTL       0x00000001U
++#define NETLINK_SCSITRANSPORT_SOCKET__READ        0x00000002U
++#define NETLINK_SCSITRANSPORT_SOCKET__WRITE       0x00000004U
++#define NETLINK_SCSITRANSPORT_SOCKET__CREATE      0x00000008U
++#define NETLINK_SCSITRANSPORT_SOCKET__GETATTR     0x00000010U
++#define NETLINK_SCSITRANSPORT_SOCKET__SETATTR     0x00000020U
++#define NETLINK_SCSITRANSPORT_SOCKET__LOCK        0x00000040U
++#define NETLINK_SCSITRANSPORT_SOCKET__RELABELFROM 0x00000080U
++#define NETLINK_SCSITRANSPORT_SOCKET__RELABELTO   0x00000100U
++#define NETLINK_SCSITRANSPORT_SOCKET__APPEND      0x00000200U
++#define NETLINK_SCSITRANSPORT_SOCKET__MAP         0x00000400U
++#define NETLINK_SCSITRANSPORT_SOCKET__BIND        0x00000800U
++#define NETLINK_SCSITRANSPORT_SOCKET__CONNECT     0x00001000U
++#define NETLINK_SCSITRANSPORT_SOCKET__LISTEN      0x00002000U
++#define NETLINK_SCSITRANSPORT_SOCKET__ACCEPT      0x00004000U
++#define NETLINK_SCSITRANSPORT_SOCKET__GETOPT      0x00008000U
++#define NETLINK_SCSITRANSPORT_SOCKET__SETOPT      0x00010000U
++#define NETLINK_SCSITRANSPORT_SOCKET__SHUTDOWN    0x00020000U
++#define NETLINK_SCSITRANSPORT_SOCKET__RECVFROM    0x00040000U
++#define NETLINK_SCSITRANSPORT_SOCKET__SENDTO      0x00080000U
++#define NETLINK_SCSITRANSPORT_SOCKET__NAME_BIND   0x00100000U
++#define NETLINK_RDMA_SOCKET__IOCTL                0x00000001U
++#define NETLINK_RDMA_SOCKET__READ                 0x00000002U
++#define NETLINK_RDMA_SOCKET__WRITE                0x00000004U
++#define NETLINK_RDMA_SOCKET__CREATE               0x00000008U
++#define NETLINK_RDMA_SOCKET__GETATTR              0x00000010U
++#define NETLINK_RDMA_SOCKET__SETATTR              0x00000020U
++#define NETLINK_RDMA_SOCKET__LOCK                 0x00000040U
++#define NETLINK_RDMA_SOCKET__RELABELFROM          0x00000080U
++#define NETLINK_RDMA_SOCKET__RELABELTO            0x00000100U
++#define NETLINK_RDMA_SOCKET__APPEND               0x00000200U
++#define NETLINK_RDMA_SOCKET__MAP                  0x00000400U
++#define NETLINK_RDMA_SOCKET__BIND                 0x00000800U
++#define NETLINK_RDMA_SOCKET__CONNECT              0x00001000U
++#define NETLINK_RDMA_SOCKET__LISTEN               0x00002000U
++#define NETLINK_RDMA_SOCKET__ACCEPT               0x00004000U
++#define NETLINK_RDMA_SOCKET__GETOPT               0x00008000U
++#define NETLINK_RDMA_SOCKET__SETOPT               0x00010000U
++#define NETLINK_RDMA_SOCKET__SHUTDOWN             0x00020000U
++#define NETLINK_RDMA_SOCKET__RECVFROM             0x00040000U
++#define NETLINK_RDMA_SOCKET__SENDTO               0x00080000U
++#define NETLINK_RDMA_SOCKET__NAME_BIND            0x00100000U
++#define NETLINK_CRYPTO_SOCKET__IOCTL              0x00000001U
++#define NETLINK_CRYPTO_SOCKET__READ               0x00000002U
++#define NETLINK_CRYPTO_SOCKET__WRITE              0x00000004U
++#define NETLINK_CRYPTO_SOCKET__CREATE             0x00000008U
++#define NETLINK_CRYPTO_SOCKET__GETATTR            0x00000010U
++#define NETLINK_CRYPTO_SOCKET__SETATTR            0x00000020U
++#define NETLINK_CRYPTO_SOCKET__LOCK               0x00000040U
++#define NETLINK_CRYPTO_SOCKET__RELABELFROM        0x00000080U
++#define NETLINK_CRYPTO_SOCKET__RELABELTO          0x00000100U
++#define NETLINK_CRYPTO_SOCKET__APPEND             0x00000200U
++#define NETLINK_CRYPTO_SOCKET__MAP                0x00000400U
++#define NETLINK_CRYPTO_SOCKET__BIND               0x00000800U
++#define NETLINK_CRYPTO_SOCKET__CONNECT            0x00001000U
++#define NETLINK_CRYPTO_SOCKET__LISTEN             0x00002000U
++#define NETLINK_CRYPTO_SOCKET__ACCEPT             0x00004000U
++#define NETLINK_CRYPTO_SOCKET__GETOPT             0x00008000U
++#define NETLINK_CRYPTO_SOCKET__SETOPT             0x00010000U
++#define NETLINK_CRYPTO_SOCKET__SHUTDOWN           0x00020000U
++#define NETLINK_CRYPTO_SOCKET__RECVFROM           0x00040000U
++#define NETLINK_CRYPTO_SOCKET__SENDTO             0x00080000U
++#define NETLINK_CRYPTO_SOCKET__NAME_BIND          0x00100000U
++#define APPLETALK_SOCKET__IOCTL                   0x00000001U
++#define APPLETALK_SOCKET__READ                    0x00000002U
++#define APPLETALK_SOCKET__WRITE                   0x00000004U
++#define APPLETALK_SOCKET__CREATE                  0x00000008U
++#define APPLETALK_SOCKET__GETATTR                 0x00000010U
++#define APPLETALK_SOCKET__SETATTR                 0x00000020U
++#define APPLETALK_SOCKET__LOCK                    0x00000040U
++#define APPLETALK_SOCKET__RELABELFROM             0x00000080U
++#define APPLETALK_SOCKET__RELABELTO               0x00000100U
++#define APPLETALK_SOCKET__APPEND                  0x00000200U
++#define APPLETALK_SOCKET__MAP                     0x00000400U
++#define APPLETALK_SOCKET__BIND                    0x00000800U
++#define APPLETALK_SOCKET__CONNECT                 0x00001000U
++#define APPLETALK_SOCKET__LISTEN                  0x00002000U
++#define APPLETALK_SOCKET__ACCEPT                  0x00004000U
++#define APPLETALK_SOCKET__GETOPT                  0x00008000U
++#define APPLETALK_SOCKET__SETOPT                  0x00010000U
++#define APPLETALK_SOCKET__SHUTDOWN                0x00020000U
++#define APPLETALK_SOCKET__RECVFROM                0x00040000U
++#define APPLETALK_SOCKET__SENDTO                  0x00080000U
++#define APPLETALK_SOCKET__NAME_BIND               0x00100000U
++#define PACKET__SEND                              0x00000001U
++#define PACKET__RECV                              0x00000002U
++#define PACKET__RELABELTO                         0x00000004U
++#define PACKET__FORWARD_IN                        0x00000008U
++#define PACKET__FORWARD_OUT                       0x00000010U
++#define KEY__VIEW                                 0x00000001U
++#define KEY__READ                                 0x00000002U
++#define KEY__WRITE                                0x00000004U
++#define KEY__SEARCH                               0x00000008U
++#define KEY__LINK                                 0x00000010U
++#define KEY__SETATTR                              0x00000020U
++#define KEY__CREATE                               0x00000040U
++#define DCCP_SOCKET__IOCTL                        0x00000001U
++#define DCCP_SOCKET__READ                         0x00000002U
++#define DCCP_SOCKET__WRITE                        0x00000004U
++#define DCCP_SOCKET__CREATE                       0x00000008U
++#define DCCP_SOCKET__GETATTR                      0x00000010U
++#define DCCP_SOCKET__SETATTR                      0x00000020U
++#define DCCP_SOCKET__LOCK                         0x00000040U
++#define DCCP_SOCKET__RELABELFROM                  0x00000080U
++#define DCCP_SOCKET__RELABELTO                    0x00000100U
++#define DCCP_SOCKET__APPEND                       0x00000200U
++#define DCCP_SOCKET__MAP                          0x00000400U
++#define DCCP_SOCKET__BIND                         0x00000800U
++#define DCCP_SOCKET__CONNECT                      0x00001000U
++#define DCCP_SOCKET__LISTEN                       0x00002000U
++#define DCCP_SOCKET__ACCEPT                       0x00004000U
++#define DCCP_SOCKET__GETOPT                       0x00008000U
++#define DCCP_SOCKET__SETOPT                       0x00010000U
++#define DCCP_SOCKET__SHUTDOWN                     0x00020000U
++#define DCCP_SOCKET__RECVFROM                     0x00040000U
++#define DCCP_SOCKET__SENDTO                       0x00080000U
++#define DCCP_SOCKET__NAME_BIND                    0x00100000U
++#define DCCP_SOCKET__NODE_BIND                    0x00200000U
++#define DCCP_SOCKET__NAME_CONNECT                 0x00400000U
++#define MEMPROTECT__MMAP_ZERO                     0x00000001U
++#define PEER__RECV                                0x00000001U
++#define CAPABILITY2__MAC_OVERRIDE                 0x00000001U
++#define CAPABILITY2__MAC_ADMIN                    0x00000002U
++#define CAPABILITY2__SYSLOG                       0x00000004U
++#define CAPABILITY2__WAKE_ALARM                   0x00000008U
++#define CAPABILITY2__BLOCK_SUSPEND                0x00000010U
++#define CAPABILITY2__AUDIT_READ                   0x00000020U
++#define CAPABILITY2__PERFMON                      0x00000040U
++#define CAPABILITY2__BPF                          0x00000080U
++#define CAPABILITY2__CHECKPOINT_RESTORE           0x00000100U
++#define KERNEL_SERVICE__USE_AS_OVERRIDE           0x00000001U
++#define KERNEL_SERVICE__CREATE_FILES_AS           0x00000002U
++#define TUN_SOCKET__IOCTL                         0x00000001U
++#define TUN_SOCKET__READ                          0x00000002U
++#define TUN_SOCKET__WRITE                         0x00000004U
++#define TUN_SOCKET__CREATE                        0x00000008U
++#define TUN_SOCKET__GETATTR                       0x00000010U
++#define TUN_SOCKET__SETATTR                       0x00000020U
++#define TUN_SOCKET__LOCK                          0x00000040U
++#define TUN_SOCKET__RELABELFROM                   0x00000080U
++#define TUN_SOCKET__RELABELTO                     0x00000100U
++#define TUN_SOCKET__APPEND                        0x00000200U
++#define TUN_SOCKET__MAP                           0x00000400U
++#define TUN_SOCKET__BIND                          0x00000800U
++#define TUN_SOCKET__CONNECT                       0x00001000U
++#define TUN_SOCKET__LISTEN                        0x00002000U
++#define TUN_SOCKET__ACCEPT                        0x00004000U
++#define TUN_SOCKET__GETOPT                        0x00008000U
++#define TUN_SOCKET__SETOPT                        0x00010000U
++#define TUN_SOCKET__SHUTDOWN                      0x00020000U
++#define TUN_SOCKET__RECVFROM                      0x00040000U
++#define TUN_SOCKET__SENDTO                        0x00080000U
++#define TUN_SOCKET__NAME_BIND                     0x00100000U
++#define TUN_SOCKET__ATTACH_QUEUE                  0x00200000U
++#define BINDER__IMPERSONATE                       0x00000001U
++#define BINDER__CALL                              0x00000002U
++#define BINDER__SET_CONTEXT_MGR                   0x00000004U
++#define BINDER__TRANSFER                          0x00000008U
++#define CAP_USERNS__CHOWN                         0x00000001U
++#define CAP_USERNS__DAC_OVERRIDE                  0x00000002U
++#define CAP_USERNS__DAC_READ_SEARCH               0x00000004U
++#define CAP_USERNS__FOWNER                        0x00000008U
++#define CAP_USERNS__FSETID                        0x00000010U
++#define CAP_USERNS__KILL                          0x00000020U
++#define CAP_USERNS__SETGID                        0x00000040U
++#define CAP_USERNS__SETUID                        0x00000080U
++#define CAP_USERNS__SETPCAP                       0x00000100U
++#define CAP_USERNS__LINUX_IMMUTABLE               0x00000200U
++#define CAP_USERNS__NET_BIND_SERVICE              0x00000400U
++#define CAP_USERNS__NET_BROADCAST                 0x00000800U
++#define CAP_USERNS__NET_ADMIN                     0x00001000U
++#define CAP_USERNS__NET_RAW                       0x00002000U
++#define CAP_USERNS__IPC_LOCK                      0x00004000U
++#define CAP_USERNS__IPC_OWNER                     0x00008000U
++#define CAP_USERNS__SYS_MODULE                    0x00010000U
++#define CAP_USERNS__SYS_RAWIO                     0x00020000U
++#define CAP_USERNS__SYS_CHROOT                    0x00040000U
++#define CAP_USERNS__SYS_PTRACE                    0x00080000U
++#define CAP_USERNS__SYS_PACCT                     0x00100000U
++#define CAP_USERNS__SYS_ADMIN                     0x00200000U
++#define CAP_USERNS__SYS_BOOT                      0x00400000U
++#define CAP_USERNS__SYS_NICE                      0x00800000U
++#define CAP_USERNS__SYS_RESOURCE                  0x01000000U
++#define CAP_USERNS__SYS_TIME                      0x02000000U
++#define CAP_USERNS__SYS_TTY_CONFIG                0x04000000U
++#define CAP_USERNS__MKNOD                         0x08000000U
++#define CAP_USERNS__LEASE                         0x10000000U
++#define CAP_USERNS__AUDIT_WRITE                   0x20000000U
++#define CAP_USERNS__AUDIT_CONTROL                 0x40000000U
++#define CAP_USERNS__SETFCAP                       0x80000000U
++#define CAP2_USERNS__MAC_OVERRIDE                 0x00000001U
++#define CAP2_USERNS__MAC_ADMIN                    0x00000002U
++#define CAP2_USERNS__SYSLOG                       0x00000004U
++#define CAP2_USERNS__WAKE_ALARM                   0x00000008U
++#define CAP2_USERNS__BLOCK_SUSPEND                0x00000010U
++#define CAP2_USERNS__AUDIT_READ                   0x00000020U
++#define CAP2_USERNS__PERFMON                      0x00000040U
++#define CAP2_USERNS__BPF                          0x00000080U
++#define CAP2_USERNS__CHECKPOINT_RESTORE           0x00000100U
++#define SCTP_SOCKET__IOCTL                        0x00000001U
++#define SCTP_SOCKET__READ                         0x00000002U
++#define SCTP_SOCKET__WRITE                        0x00000004U
++#define SCTP_SOCKET__CREATE                       0x00000008U
++#define SCTP_SOCKET__GETATTR                      0x00000010U
++#define SCTP_SOCKET__SETATTR                      0x00000020U
++#define SCTP_SOCKET__LOCK                         0x00000040U
++#define SCTP_SOCKET__RELABELFROM                  0x00000080U
++#define SCTP_SOCKET__RELABELTO                    0x00000100U
++#define SCTP_SOCKET__APPEND                       0x00000200U
++#define SCTP_SOCKET__MAP                          0x00000400U
++#define SCTP_SOCKET__BIND                         0x00000800U
++#define SCTP_SOCKET__CONNECT                      0x00001000U
++#define SCTP_SOCKET__LISTEN                       0x00002000U
++#define SCTP_SOCKET__ACCEPT                       0x00004000U
++#define SCTP_SOCKET__GETOPT                       0x00008000U
++#define SCTP_SOCKET__SETOPT                       0x00010000U
++#define SCTP_SOCKET__SHUTDOWN                     0x00020000U
++#define SCTP_SOCKET__RECVFROM                     0x00040000U
++#define SCTP_SOCKET__SENDTO                       0x00080000U
++#define SCTP_SOCKET__NAME_BIND                    0x00100000U
++#define SCTP_SOCKET__NODE_BIND                    0x00200000U
++#define SCTP_SOCKET__NAME_CONNECT                 0x00400000U
++#define SCTP_SOCKET__ASSOCIATION                  0x00800000U
++#define ICMP_SOCKET__IOCTL                        0x00000001U
++#define ICMP_SOCKET__READ                         0x00000002U
++#define ICMP_SOCKET__WRITE                        0x00000004U
++#define ICMP_SOCKET__CREATE                       0x00000008U
++#define ICMP_SOCKET__GETATTR                      0x00000010U
++#define ICMP_SOCKET__SETATTR                      0x00000020U
++#define ICMP_SOCKET__LOCK                         0x00000040U
++#define ICMP_SOCKET__RELABELFROM                  0x00000080U
++#define ICMP_SOCKET__RELABELTO                    0x00000100U
++#define ICMP_SOCKET__APPEND                       0x00000200U
++#define ICMP_SOCKET__MAP                          0x00000400U
++#define ICMP_SOCKET__BIND                         0x00000800U
++#define ICMP_SOCKET__CONNECT                      0x00001000U
++#define ICMP_SOCKET__LISTEN                       0x00002000U
++#define ICMP_SOCKET__ACCEPT                       0x00004000U
++#define ICMP_SOCKET__GETOPT                       0x00008000U
++#define ICMP_SOCKET__SETOPT                       0x00010000U
++#define ICMP_SOCKET__SHUTDOWN                     0x00020000U
++#define ICMP_SOCKET__RECVFROM                     0x00040000U
++#define ICMP_SOCKET__SENDTO                       0x00080000U
++#define ICMP_SOCKET__NAME_BIND                    0x00100000U
++#define ICMP_SOCKET__NODE_BIND                    0x00200000U
++#define AX25_SOCKET__IOCTL                        0x00000001U
++#define AX25_SOCKET__READ                         0x00000002U
++#define AX25_SOCKET__WRITE                        0x00000004U
++#define AX25_SOCKET__CREATE                       0x00000008U
++#define AX25_SOCKET__GETATTR                      0x00000010U
++#define AX25_SOCKET__SETATTR                      0x00000020U
++#define AX25_SOCKET__LOCK                         0x00000040U
++#define AX25_SOCKET__RELABELFROM                  0x00000080U
++#define AX25_SOCKET__RELABELTO                    0x00000100U
++#define AX25_SOCKET__APPEND                       0x00000200U
++#define AX25_SOCKET__MAP                          0x00000400U
++#define AX25_SOCKET__BIND                         0x00000800U
++#define AX25_SOCKET__CONNECT                      0x00001000U
++#define AX25_SOCKET__LISTEN                       0x00002000U
++#define AX25_SOCKET__ACCEPT                       0x00004000U
++#define AX25_SOCKET__GETOPT                       0x00008000U
++#define AX25_SOCKET__SETOPT                       0x00010000U
++#define AX25_SOCKET__SHUTDOWN                     0x00020000U
++#define AX25_SOCKET__RECVFROM                     0x00040000U
++#define AX25_SOCKET__SENDTO                       0x00080000U
++#define AX25_SOCKET__NAME_BIND                    0x00100000U
++#define IPX_SOCKET__IOCTL                         0x00000001U
++#define IPX_SOCKET__READ                          0x00000002U
++#define IPX_SOCKET__WRITE                         0x00000004U
++#define IPX_SOCKET__CREATE                        0x00000008U
++#define IPX_SOCKET__GETATTR                       0x00000010U
++#define IPX_SOCKET__SETATTR                       0x00000020U
++#define IPX_SOCKET__LOCK                          0x00000040U
++#define IPX_SOCKET__RELABELFROM                   0x00000080U
++#define IPX_SOCKET__RELABELTO                     0x00000100U
++#define IPX_SOCKET__APPEND                        0x00000200U
++#define IPX_SOCKET__MAP                           0x00000400U
++#define IPX_SOCKET__BIND                          0x00000800U
++#define IPX_SOCKET__CONNECT                       0x00001000U
++#define IPX_SOCKET__LISTEN                        0x00002000U
++#define IPX_SOCKET__ACCEPT                        0x00004000U
++#define IPX_SOCKET__GETOPT                        0x00008000U
++#define IPX_SOCKET__SETOPT                        0x00010000U
++#define IPX_SOCKET__SHUTDOWN                      0x00020000U
++#define IPX_SOCKET__RECVFROM                      0x00040000U
++#define IPX_SOCKET__SENDTO                        0x00080000U
++#define IPX_SOCKET__NAME_BIND                     0x00100000U
++#define NETROM_SOCKET__IOCTL                      0x00000001U
++#define NETROM_SOCKET__READ                       0x00000002U
++#define NETROM_SOCKET__WRITE                      0x00000004U
++#define NETROM_SOCKET__CREATE                     0x00000008U
++#define NETROM_SOCKET__GETATTR                    0x00000010U
++#define NETROM_SOCKET__SETATTR                    0x00000020U
++#define NETROM_SOCKET__LOCK                       0x00000040U
++#define NETROM_SOCKET__RELABELFROM                0x00000080U
++#define NETROM_SOCKET__RELABELTO                  0x00000100U
++#define NETROM_SOCKET__APPEND                     0x00000200U
++#define NETROM_SOCKET__MAP                        0x00000400U
++#define NETROM_SOCKET__BIND                       0x00000800U
++#define NETROM_SOCKET__CONNECT                    0x00001000U
++#define NETROM_SOCKET__LISTEN                     0x00002000U
++#define NETROM_SOCKET__ACCEPT                     0x00004000U
++#define NETROM_SOCKET__GETOPT                     0x00008000U
++#define NETROM_SOCKET__SETOPT                     0x00010000U
++#define NETROM_SOCKET__SHUTDOWN                   0x00020000U
++#define NETROM_SOCKET__RECVFROM                   0x00040000U
++#define NETROM_SOCKET__SENDTO                     0x00080000U
++#define NETROM_SOCKET__NAME_BIND                  0x00100000U
++#define ATMPVC_SOCKET__IOCTL                      0x00000001U
++#define ATMPVC_SOCKET__READ                       0x00000002U
++#define ATMPVC_SOCKET__WRITE                      0x00000004U
++#define ATMPVC_SOCKET__CREATE                     0x00000008U
++#define ATMPVC_SOCKET__GETATTR                    0x00000010U
++#define ATMPVC_SOCKET__SETATTR                    0x00000020U
++#define ATMPVC_SOCKET__LOCK                       0x00000040U
++#define ATMPVC_SOCKET__RELABELFROM                0x00000080U
++#define ATMPVC_SOCKET__RELABELTO                  0x00000100U
++#define ATMPVC_SOCKET__APPEND                     0x00000200U
++#define ATMPVC_SOCKET__MAP                        0x00000400U
++#define ATMPVC_SOCKET__BIND                       0x00000800U
++#define ATMPVC_SOCKET__CONNECT                    0x00001000U
++#define ATMPVC_SOCKET__LISTEN                     0x00002000U
++#define ATMPVC_SOCKET__ACCEPT                     0x00004000U
++#define ATMPVC_SOCKET__GETOPT                     0x00008000U
++#define ATMPVC_SOCKET__SETOPT                     0x00010000U
++#define ATMPVC_SOCKET__SHUTDOWN                   0x00020000U
++#define ATMPVC_SOCKET__RECVFROM                   0x00040000U
++#define ATMPVC_SOCKET__SENDTO                     0x00080000U
++#define ATMPVC_SOCKET__NAME_BIND                  0x00100000U
++#define X25_SOCKET__IOCTL                         0x00000001U
++#define X25_SOCKET__READ                          0x00000002U
++#define X25_SOCKET__WRITE                         0x00000004U
++#define X25_SOCKET__CREATE                        0x00000008U
++#define X25_SOCKET__GETATTR                       0x00000010U
++#define X25_SOCKET__SETATTR                       0x00000020U
++#define X25_SOCKET__LOCK                          0x00000040U
++#define X25_SOCKET__RELABELFROM                   0x00000080U
++#define X25_SOCKET__RELABELTO                     0x00000100U
++#define X25_SOCKET__APPEND                        0x00000200U
++#define X25_SOCKET__MAP                           0x00000400U
++#define X25_SOCKET__BIND                          0x00000800U
++#define X25_SOCKET__CONNECT                       0x00001000U
++#define X25_SOCKET__LISTEN                        0x00002000U
++#define X25_SOCKET__ACCEPT                        0x00004000U
++#define X25_SOCKET__GETOPT                        0x00008000U
++#define X25_SOCKET__SETOPT                        0x00010000U
++#define X25_SOCKET__SHUTDOWN                      0x00020000U
++#define X25_SOCKET__RECVFROM                      0x00040000U
++#define X25_SOCKET__SENDTO                        0x00080000U
++#define X25_SOCKET__NAME_BIND                     0x00100000U
++#define ROSE_SOCKET__IOCTL                        0x00000001U
++#define ROSE_SOCKET__READ                         0x00000002U
++#define ROSE_SOCKET__WRITE                        0x00000004U
++#define ROSE_SOCKET__CREATE                       0x00000008U
++#define ROSE_SOCKET__GETATTR                      0x00000010U
++#define ROSE_SOCKET__SETATTR                      0x00000020U
++#define ROSE_SOCKET__LOCK                         0x00000040U
++#define ROSE_SOCKET__RELABELFROM                  0x00000080U
++#define ROSE_SOCKET__RELABELTO                    0x00000100U
++#define ROSE_SOCKET__APPEND                       0x00000200U
++#define ROSE_SOCKET__MAP                          0x00000400U
++#define ROSE_SOCKET__BIND                         0x00000800U
++#define ROSE_SOCKET__CONNECT                      0x00001000U
++#define ROSE_SOCKET__LISTEN                       0x00002000U
++#define ROSE_SOCKET__ACCEPT                       0x00004000U
++#define ROSE_SOCKET__GETOPT                       0x00008000U
++#define ROSE_SOCKET__SETOPT                       0x00010000U
++#define ROSE_SOCKET__SHUTDOWN                     0x00020000U
++#define ROSE_SOCKET__RECVFROM                     0x00040000U
++#define ROSE_SOCKET__SENDTO                       0x00080000U
++#define ROSE_SOCKET__NAME_BIND                    0x00100000U
++#define DECNET_SOCKET__IOCTL                      0x00000001U
++#define DECNET_SOCKET__READ                       0x00000002U
++#define DECNET_SOCKET__WRITE                      0x00000004U
++#define DECNET_SOCKET__CREATE                     0x00000008U
++#define DECNET_SOCKET__GETATTR                    0x00000010U
++#define DECNET_SOCKET__SETATTR                    0x00000020U
++#define DECNET_SOCKET__LOCK                       0x00000040U
++#define DECNET_SOCKET__RELABELFROM                0x00000080U
++#define DECNET_SOCKET__RELABELTO                  0x00000100U
++#define DECNET_SOCKET__APPEND                     0x00000200U
++#define DECNET_SOCKET__MAP                        0x00000400U
++#define DECNET_SOCKET__BIND                       0x00000800U
++#define DECNET_SOCKET__CONNECT                    0x00001000U
++#define DECNET_SOCKET__LISTEN                     0x00002000U
++#define DECNET_SOCKET__ACCEPT                     0x00004000U
++#define DECNET_SOCKET__GETOPT                     0x00008000U
++#define DECNET_SOCKET__SETOPT                     0x00010000U
++#define DECNET_SOCKET__SHUTDOWN                   0x00020000U
++#define DECNET_SOCKET__RECVFROM                   0x00040000U
++#define DECNET_SOCKET__SENDTO                     0x00080000U
++#define DECNET_SOCKET__NAME_BIND                  0x00100000U
++#define ATMSVC_SOCKET__IOCTL                      0x00000001U
++#define ATMSVC_SOCKET__READ                       0x00000002U
++#define ATMSVC_SOCKET__WRITE                      0x00000004U
++#define ATMSVC_SOCKET__CREATE                     0x00000008U
++#define ATMSVC_SOCKET__GETATTR                    0x00000010U
++#define ATMSVC_SOCKET__SETATTR                    0x00000020U
++#define ATMSVC_SOCKET__LOCK                       0x00000040U
++#define ATMSVC_SOCKET__RELABELFROM                0x00000080U
++#define ATMSVC_SOCKET__RELABELTO                  0x00000100U
++#define ATMSVC_SOCKET__APPEND                     0x00000200U
++#define ATMSVC_SOCKET__MAP                        0x00000400U
++#define ATMSVC_SOCKET__BIND                       0x00000800U
++#define ATMSVC_SOCKET__CONNECT                    0x00001000U
++#define ATMSVC_SOCKET__LISTEN                     0x00002000U
++#define ATMSVC_SOCKET__ACCEPT                     0x00004000U
++#define ATMSVC_SOCKET__GETOPT                     0x00008000U
++#define ATMSVC_SOCKET__SETOPT                     0x00010000U
++#define ATMSVC_SOCKET__SHUTDOWN                   0x00020000U
++#define ATMSVC_SOCKET__RECVFROM                   0x00040000U
++#define ATMSVC_SOCKET__SENDTO                     0x00080000U
++#define ATMSVC_SOCKET__NAME_BIND                  0x00100000U
++#define RDS_SOCKET__IOCTL                         0x00000001U
++#define RDS_SOCKET__READ                          0x00000002U
++#define RDS_SOCKET__WRITE                         0x00000004U
++#define RDS_SOCKET__CREATE                        0x00000008U
++#define RDS_SOCKET__GETATTR                       0x00000010U
++#define RDS_SOCKET__SETATTR                       0x00000020U
++#define RDS_SOCKET__LOCK                          0x00000040U
++#define RDS_SOCKET__RELABELFROM                   0x00000080U
++#define RDS_SOCKET__RELABELTO                     0x00000100U
++#define RDS_SOCKET__APPEND                        0x00000200U
++#define RDS_SOCKET__MAP                           0x00000400U
++#define RDS_SOCKET__BIND                          0x00000800U
++#define RDS_SOCKET__CONNECT                       0x00001000U
++#define RDS_SOCKET__LISTEN                        0x00002000U
++#define RDS_SOCKET__ACCEPT                        0x00004000U
++#define RDS_SOCKET__GETOPT                        0x00008000U
++#define RDS_SOCKET__SETOPT                        0x00010000U
++#define RDS_SOCKET__SHUTDOWN                      0x00020000U
++#define RDS_SOCKET__RECVFROM                      0x00040000U
++#define RDS_SOCKET__SENDTO                        0x00080000U
++#define RDS_SOCKET__NAME_BIND                     0x00100000U
++#define IRDA_SOCKET__IOCTL                        0x00000001U
++#define IRDA_SOCKET__READ                         0x00000002U
++#define IRDA_SOCKET__WRITE                        0x00000004U
++#define IRDA_SOCKET__CREATE                       0x00000008U
++#define IRDA_SOCKET__GETATTR                      0x00000010U
++#define IRDA_SOCKET__SETATTR                      0x00000020U
++#define IRDA_SOCKET__LOCK                         0x00000040U
++#define IRDA_SOCKET__RELABELFROM                  0x00000080U
++#define IRDA_SOCKET__RELABELTO                    0x00000100U
++#define IRDA_SOCKET__APPEND                       0x00000200U
++#define IRDA_SOCKET__MAP                          0x00000400U
++#define IRDA_SOCKET__BIND                         0x00000800U
++#define IRDA_SOCKET__CONNECT                      0x00001000U
++#define IRDA_SOCKET__LISTEN                       0x00002000U
++#define IRDA_SOCKET__ACCEPT                       0x00004000U
++#define IRDA_SOCKET__GETOPT                       0x00008000U
++#define IRDA_SOCKET__SETOPT                       0x00010000U
++#define IRDA_SOCKET__SHUTDOWN                     0x00020000U
++#define IRDA_SOCKET__RECVFROM                     0x00040000U
++#define IRDA_SOCKET__SENDTO                       0x00080000U
++#define IRDA_SOCKET__NAME_BIND                    0x00100000U
++#define PPPOX_SOCKET__IOCTL                       0x00000001U
++#define PPPOX_SOCKET__READ                        0x00000002U
++#define PPPOX_SOCKET__WRITE                       0x00000004U
++#define PPPOX_SOCKET__CREATE                      0x00000008U
++#define PPPOX_SOCKET__GETATTR                     0x00000010U
++#define PPPOX_SOCKET__SETATTR                     0x00000020U
++#define PPPOX_SOCKET__LOCK                        0x00000040U
++#define PPPOX_SOCKET__RELABELFROM                 0x00000080U
++#define PPPOX_SOCKET__RELABELTO                   0x00000100U
++#define PPPOX_SOCKET__APPEND                      0x00000200U
++#define PPPOX_SOCKET__MAP                         0x00000400U
++#define PPPOX_SOCKET__BIND                        0x00000800U
++#define PPPOX_SOCKET__CONNECT                     0x00001000U
++#define PPPOX_SOCKET__LISTEN                      0x00002000U
++#define PPPOX_SOCKET__ACCEPT                      0x00004000U
++#define PPPOX_SOCKET__GETOPT                      0x00008000U
++#define PPPOX_SOCKET__SETOPT                      0x00010000U
++#define PPPOX_SOCKET__SHUTDOWN                    0x00020000U
++#define PPPOX_SOCKET__RECVFROM                    0x00040000U
++#define PPPOX_SOCKET__SENDTO                      0x00080000U
++#define PPPOX_SOCKET__NAME_BIND                   0x00100000U
++#define LLC_SOCKET__IOCTL                         0x00000001U
++#define LLC_SOCKET__READ                          0x00000002U
++#define LLC_SOCKET__WRITE                         0x00000004U
++#define LLC_SOCKET__CREATE                        0x00000008U
++#define LLC_SOCKET__GETATTR                       0x00000010U
++#define LLC_SOCKET__SETATTR                       0x00000020U
++#define LLC_SOCKET__LOCK                          0x00000040U
++#define LLC_SOCKET__RELABELFROM                   0x00000080U
++#define LLC_SOCKET__RELABELTO                     0x00000100U
++#define LLC_SOCKET__APPEND                        0x00000200U
++#define LLC_SOCKET__MAP                           0x00000400U
++#define LLC_SOCKET__BIND                          0x00000800U
++#define LLC_SOCKET__CONNECT                       0x00001000U
++#define LLC_SOCKET__LISTEN                        0x00002000U
++#define LLC_SOCKET__ACCEPT                        0x00004000U
++#define LLC_SOCKET__GETOPT                        0x00008000U
++#define LLC_SOCKET__SETOPT                        0x00010000U
++#define LLC_SOCKET__SHUTDOWN                      0x00020000U
++#define LLC_SOCKET__RECVFROM                      0x00040000U
++#define LLC_SOCKET__SENDTO                        0x00080000U
++#define LLC_SOCKET__NAME_BIND                     0x00100000U
++#define CAN_SOCKET__IOCTL                         0x00000001U
++#define CAN_SOCKET__READ                          0x00000002U
++#define CAN_SOCKET__WRITE                         0x00000004U
++#define CAN_SOCKET__CREATE                        0x00000008U
++#define CAN_SOCKET__GETATTR                       0x00000010U
++#define CAN_SOCKET__SETATTR                       0x00000020U
++#define CAN_SOCKET__LOCK                          0x00000040U
++#define CAN_SOCKET__RELABELFROM                   0x00000080U
++#define CAN_SOCKET__RELABELTO                     0x00000100U
++#define CAN_SOCKET__APPEND                        0x00000200U
++#define CAN_SOCKET__MAP                           0x00000400U
++#define CAN_SOCKET__BIND                          0x00000800U
++#define CAN_SOCKET__CONNECT                       0x00001000U
++#define CAN_SOCKET__LISTEN                        0x00002000U
++#define CAN_SOCKET__ACCEPT                        0x00004000U
++#define CAN_SOCKET__GETOPT                        0x00008000U
++#define CAN_SOCKET__SETOPT                        0x00010000U
++#define CAN_SOCKET__SHUTDOWN                      0x00020000U
++#define CAN_SOCKET__RECVFROM                      0x00040000U
++#define CAN_SOCKET__SENDTO                        0x00080000U
++#define CAN_SOCKET__NAME_BIND                     0x00100000U
++#define TIPC_SOCKET__IOCTL                        0x00000001U
++#define TIPC_SOCKET__READ                         0x00000002U
++#define TIPC_SOCKET__WRITE                        0x00000004U
++#define TIPC_SOCKET__CREATE                       0x00000008U
++#define TIPC_SOCKET__GETATTR                      0x00000010U
++#define TIPC_SOCKET__SETATTR                      0x00000020U
++#define TIPC_SOCKET__LOCK                         0x00000040U
++#define TIPC_SOCKET__RELABELFROM                  0x00000080U
++#define TIPC_SOCKET__RELABELTO                    0x00000100U
++#define TIPC_SOCKET__APPEND                       0x00000200U
++#define TIPC_SOCKET__MAP                          0x00000400U
++#define TIPC_SOCKET__BIND                         0x00000800U
++#define TIPC_SOCKET__CONNECT                      0x00001000U
++#define TIPC_SOCKET__LISTEN                       0x00002000U
++#define TIPC_SOCKET__ACCEPT                       0x00004000U
++#define TIPC_SOCKET__GETOPT                       0x00008000U
++#define TIPC_SOCKET__SETOPT                       0x00010000U
++#define TIPC_SOCKET__SHUTDOWN                     0x00020000U
++#define TIPC_SOCKET__RECVFROM                     0x00040000U
++#define TIPC_SOCKET__SENDTO                       0x00080000U
++#define TIPC_SOCKET__NAME_BIND                    0x00100000U
++#define BLUETOOTH_SOCKET__IOCTL                   0x00000001U
++#define BLUETOOTH_SOCKET__READ                    0x00000002U
++#define BLUETOOTH_SOCKET__WRITE                   0x00000004U
++#define BLUETOOTH_SOCKET__CREATE                  0x00000008U
++#define BLUETOOTH_SOCKET__GETATTR                 0x00000010U
++#define BLUETOOTH_SOCKET__SETATTR                 0x00000020U
++#define BLUETOOTH_SOCKET__LOCK                    0x00000040U
++#define BLUETOOTH_SOCKET__RELABELFROM             0x00000080U
++#define BLUETOOTH_SOCKET__RELABELTO               0x00000100U
++#define BLUETOOTH_SOCKET__APPEND                  0x00000200U
++#define BLUETOOTH_SOCKET__MAP                     0x00000400U
++#define BLUETOOTH_SOCKET__BIND                    0x00000800U
++#define BLUETOOTH_SOCKET__CONNECT                 0x00001000U
++#define BLUETOOTH_SOCKET__LISTEN                  0x00002000U
++#define BLUETOOTH_SOCKET__ACCEPT                  0x00004000U
++#define BLUETOOTH_SOCKET__GETOPT                  0x00008000U
++#define BLUETOOTH_SOCKET__SETOPT                  0x00010000U
++#define BLUETOOTH_SOCKET__SHUTDOWN                0x00020000U
++#define BLUETOOTH_SOCKET__RECVFROM                0x00040000U
++#define BLUETOOTH_SOCKET__SENDTO                  0x00080000U
++#define BLUETOOTH_SOCKET__NAME_BIND               0x00100000U
++#define IUCV_SOCKET__IOCTL                        0x00000001U
++#define IUCV_SOCKET__READ                         0x00000002U
++#define IUCV_SOCKET__WRITE                        0x00000004U
++#define IUCV_SOCKET__CREATE                       0x00000008U
++#define IUCV_SOCKET__GETATTR                      0x00000010U
++#define IUCV_SOCKET__SETATTR                      0x00000020U
++#define IUCV_SOCKET__LOCK                         0x00000040U
++#define IUCV_SOCKET__RELABELFROM                  0x00000080U
++#define IUCV_SOCKET__RELABELTO                    0x00000100U
++#define IUCV_SOCKET__APPEND                       0x00000200U
++#define IUCV_SOCKET__MAP                          0x00000400U
++#define IUCV_SOCKET__BIND                         0x00000800U
++#define IUCV_SOCKET__CONNECT                      0x00001000U
++#define IUCV_SOCKET__LISTEN                       0x00002000U
++#define IUCV_SOCKET__ACCEPT                       0x00004000U
++#define IUCV_SOCKET__GETOPT                       0x00008000U
++#define IUCV_SOCKET__SETOPT                       0x00010000U
++#define IUCV_SOCKET__SHUTDOWN                     0x00020000U
++#define IUCV_SOCKET__RECVFROM                     0x00040000U
++#define IUCV_SOCKET__SENDTO                       0x00080000U
++#define IUCV_SOCKET__NAME_BIND                    0x00100000U
++#define RXRPC_SOCKET__IOCTL                       0x00000001U
++#define RXRPC_SOCKET__READ                        0x00000002U
++#define RXRPC_SOCKET__WRITE                       0x00000004U
++#define RXRPC_SOCKET__CREATE                      0x00000008U
++#define RXRPC_SOCKET__GETATTR                     0x00000010U
++#define RXRPC_SOCKET__SETATTR                     0x00000020U
++#define RXRPC_SOCKET__LOCK                        0x00000040U
++#define RXRPC_SOCKET__RELABELFROM                 0x00000080U
++#define RXRPC_SOCKET__RELABELTO                   0x00000100U
++#define RXRPC_SOCKET__APPEND                      0x00000200U
++#define RXRPC_SOCKET__MAP                         0x00000400U
++#define RXRPC_SOCKET__BIND                        0x00000800U
++#define RXRPC_SOCKET__CONNECT                     0x00001000U
++#define RXRPC_SOCKET__LISTEN                      0x00002000U
++#define RXRPC_SOCKET__ACCEPT                      0x00004000U
++#define RXRPC_SOCKET__GETOPT                      0x00008000U
++#define RXRPC_SOCKET__SETOPT                      0x00010000U
++#define RXRPC_SOCKET__SHUTDOWN                    0x00020000U
++#define RXRPC_SOCKET__RECVFROM                    0x00040000U
++#define RXRPC_SOCKET__SENDTO                      0x00080000U
++#define RXRPC_SOCKET__NAME_BIND                   0x00100000U
++#define ISDN_SOCKET__IOCTL                        0x00000001U
++#define ISDN_SOCKET__READ                         0x00000002U
++#define ISDN_SOCKET__WRITE                        0x00000004U
++#define ISDN_SOCKET__CREATE                       0x00000008U
++#define ISDN_SOCKET__GETATTR                      0x00000010U
++#define ISDN_SOCKET__SETATTR                      0x00000020U
++#define ISDN_SOCKET__LOCK                         0x00000040U
++#define ISDN_SOCKET__RELABELFROM                  0x00000080U
++#define ISDN_SOCKET__RELABELTO                    0x00000100U
++#define ISDN_SOCKET__APPEND                       0x00000200U
++#define ISDN_SOCKET__MAP                          0x00000400U
++#define ISDN_SOCKET__BIND                         0x00000800U
++#define ISDN_SOCKET__CONNECT                      0x00001000U
++#define ISDN_SOCKET__LISTEN                       0x00002000U
++#define ISDN_SOCKET__ACCEPT                       0x00004000U
++#define ISDN_SOCKET__GETOPT                       0x00008000U
++#define ISDN_SOCKET__SETOPT                       0x00010000U
++#define ISDN_SOCKET__SHUTDOWN                     0x00020000U
++#define ISDN_SOCKET__RECVFROM                     0x00040000U
++#define ISDN_SOCKET__SENDTO                       0x00080000U
++#define ISDN_SOCKET__NAME_BIND                    0x00100000U
++#define PHONET_SOCKET__IOCTL                      0x00000001U
++#define PHONET_SOCKET__READ                       0x00000002U
++#define PHONET_SOCKET__WRITE                      0x00000004U
++#define PHONET_SOCKET__CREATE                     0x00000008U
++#define PHONET_SOCKET__GETATTR                    0x00000010U
++#define PHONET_SOCKET__SETATTR                    0x00000020U
++#define PHONET_SOCKET__LOCK                       0x00000040U
++#define PHONET_SOCKET__RELABELFROM                0x00000080U
++#define PHONET_SOCKET__RELABELTO                  0x00000100U
++#define PHONET_SOCKET__APPEND                     0x00000200U
++#define PHONET_SOCKET__MAP                        0x00000400U
++#define PHONET_SOCKET__BIND                       0x00000800U
++#define PHONET_SOCKET__CONNECT                    0x00001000U
++#define PHONET_SOCKET__LISTEN                     0x00002000U
++#define PHONET_SOCKET__ACCEPT                     0x00004000U
++#define PHONET_SOCKET__GETOPT                     0x00008000U
++#define PHONET_SOCKET__SETOPT                     0x00010000U
++#define PHONET_SOCKET__SHUTDOWN                   0x00020000U
++#define PHONET_SOCKET__RECVFROM                   0x00040000U
++#define PHONET_SOCKET__SENDTO                     0x00080000U
++#define PHONET_SOCKET__NAME_BIND                  0x00100000U
++#define IEEE802154_SOCKET__IOCTL                  0x00000001U
++#define IEEE802154_SOCKET__READ                   0x00000002U
++#define IEEE802154_SOCKET__WRITE                  0x00000004U
++#define IEEE802154_SOCKET__CREATE                 0x00000008U
++#define IEEE802154_SOCKET__GETATTR                0x00000010U
++#define IEEE802154_SOCKET__SETATTR                0x00000020U
++#define IEEE802154_SOCKET__LOCK                   0x00000040U
++#define IEEE802154_SOCKET__RELABELFROM            0x00000080U
++#define IEEE802154_SOCKET__RELABELTO              0x00000100U
++#define IEEE802154_SOCKET__APPEND                 0x00000200U
++#define IEEE802154_SOCKET__MAP                    0x00000400U
++#define IEEE802154_SOCKET__BIND                   0x00000800U
++#define IEEE802154_SOCKET__CONNECT                0x00001000U
++#define IEEE802154_SOCKET__LISTEN                 0x00002000U
++#define IEEE802154_SOCKET__ACCEPT                 0x00004000U
++#define IEEE802154_SOCKET__GETOPT                 0x00008000U
++#define IEEE802154_SOCKET__SETOPT                 0x00010000U
++#define IEEE802154_SOCKET__SHUTDOWN               0x00020000U
++#define IEEE802154_SOCKET__RECVFROM               0x00040000U
++#define IEEE802154_SOCKET__SENDTO                 0x00080000U
++#define IEEE802154_SOCKET__NAME_BIND              0x00100000U
++#define CAIF_SOCKET__IOCTL                        0x00000001U
++#define CAIF_SOCKET__READ                         0x00000002U
++#define CAIF_SOCKET__WRITE                        0x00000004U
++#define CAIF_SOCKET__CREATE                       0x00000008U
++#define CAIF_SOCKET__GETATTR                      0x00000010U
++#define CAIF_SOCKET__SETATTR                      0x00000020U
++#define CAIF_SOCKET__LOCK                         0x00000040U
++#define CAIF_SOCKET__RELABELFROM                  0x00000080U
++#define CAIF_SOCKET__RELABELTO                    0x00000100U
++#define CAIF_SOCKET__APPEND                       0x00000200U
++#define CAIF_SOCKET__MAP                          0x00000400U
++#define CAIF_SOCKET__BIND                         0x00000800U
++#define CAIF_SOCKET__CONNECT                      0x00001000U
++#define CAIF_SOCKET__LISTEN                       0x00002000U
++#define CAIF_SOCKET__ACCEPT                       0x00004000U
++#define CAIF_SOCKET__GETOPT                       0x00008000U
++#define CAIF_SOCKET__SETOPT                       0x00010000U
++#define CAIF_SOCKET__SHUTDOWN                     0x00020000U
++#define CAIF_SOCKET__RECVFROM                     0x00040000U
++#define CAIF_SOCKET__SENDTO                       0x00080000U
++#define CAIF_SOCKET__NAME_BIND                    0x00100000U
++#define ALG_SOCKET__IOCTL                         0x00000001U
++#define ALG_SOCKET__READ                          0x00000002U
++#define ALG_SOCKET__WRITE                         0x00000004U
++#define ALG_SOCKET__CREATE                        0x00000008U
++#define ALG_SOCKET__GETATTR                       0x00000010U
++#define ALG_SOCKET__SETATTR                       0x00000020U
++#define ALG_SOCKET__LOCK                          0x00000040U
++#define ALG_SOCKET__RELABELFROM                   0x00000080U
++#define ALG_SOCKET__RELABELTO                     0x00000100U
++#define ALG_SOCKET__APPEND                        0x00000200U
++#define ALG_SOCKET__MAP                           0x00000400U
++#define ALG_SOCKET__BIND                          0x00000800U
++#define ALG_SOCKET__CONNECT                       0x00001000U
++#define ALG_SOCKET__LISTEN                        0x00002000U
++#define ALG_SOCKET__ACCEPT                        0x00004000U
++#define ALG_SOCKET__GETOPT                        0x00008000U
++#define ALG_SOCKET__SETOPT                        0x00010000U
++#define ALG_SOCKET__SHUTDOWN                      0x00020000U
++#define ALG_SOCKET__RECVFROM                      0x00040000U
++#define ALG_SOCKET__SENDTO                        0x00080000U
++#define ALG_SOCKET__NAME_BIND                     0x00100000U
++#define NFC_SOCKET__IOCTL                         0x00000001U
++#define NFC_SOCKET__READ                          0x00000002U
++#define NFC_SOCKET__WRITE                         0x00000004U
++#define NFC_SOCKET__CREATE                        0x00000008U
++#define NFC_SOCKET__GETATTR                       0x00000010U
++#define NFC_SOCKET__SETATTR                       0x00000020U
++#define NFC_SOCKET__LOCK                          0x00000040U
++#define NFC_SOCKET__RELABELFROM                   0x00000080U
++#define NFC_SOCKET__RELABELTO                     0x00000100U
++#define NFC_SOCKET__APPEND                        0x00000200U
++#define NFC_SOCKET__MAP                           0x00000400U
++#define NFC_SOCKET__BIND                          0x00000800U
++#define NFC_SOCKET__CONNECT                       0x00001000U
++#define NFC_SOCKET__LISTEN                        0x00002000U
++#define NFC_SOCKET__ACCEPT                        0x00004000U
++#define NFC_SOCKET__GETOPT                        0x00008000U
++#define NFC_SOCKET__SETOPT                        0x00010000U
++#define NFC_SOCKET__SHUTDOWN                      0x00020000U
++#define NFC_SOCKET__RECVFROM                      0x00040000U
++#define NFC_SOCKET__SENDTO                        0x00080000U
++#define NFC_SOCKET__NAME_BIND                     0x00100000U
++#define VSOCK_SOCKET__IOCTL                       0x00000001U
++#define VSOCK_SOCKET__READ                        0x00000002U
++#define VSOCK_SOCKET__WRITE                       0x00000004U
++#define VSOCK_SOCKET__CREATE                      0x00000008U
++#define VSOCK_SOCKET__GETATTR                     0x00000010U
++#define VSOCK_SOCKET__SETATTR                     0x00000020U
++#define VSOCK_SOCKET__LOCK                        0x00000040U
++#define VSOCK_SOCKET__RELABELFROM                 0x00000080U
++#define VSOCK_SOCKET__RELABELTO                   0x00000100U
++#define VSOCK_SOCKET__APPEND                      0x00000200U
++#define VSOCK_SOCKET__MAP                         0x00000400U
++#define VSOCK_SOCKET__BIND                        0x00000800U
++#define VSOCK_SOCKET__CONNECT                     0x00001000U
++#define VSOCK_SOCKET__LISTEN                      0x00002000U
++#define VSOCK_SOCKET__ACCEPT                      0x00004000U
++#define VSOCK_SOCKET__GETOPT                      0x00008000U
++#define VSOCK_SOCKET__SETOPT                      0x00010000U
++#define VSOCK_SOCKET__SHUTDOWN                    0x00020000U
++#define VSOCK_SOCKET__RECVFROM                    0x00040000U
++#define VSOCK_SOCKET__SENDTO                      0x00080000U
++#define VSOCK_SOCKET__NAME_BIND                   0x00100000U
++#define KCM_SOCKET__IOCTL                         0x00000001U
++#define KCM_SOCKET__READ                          0x00000002U
++#define KCM_SOCKET__WRITE                         0x00000004U
++#define KCM_SOCKET__CREATE                        0x00000008U
++#define KCM_SOCKET__GETATTR                       0x00000010U
++#define KCM_SOCKET__SETATTR                       0x00000020U
++#define KCM_SOCKET__LOCK                          0x00000040U
++#define KCM_SOCKET__RELABELFROM                   0x00000080U
++#define KCM_SOCKET__RELABELTO                     0x00000100U
++#define KCM_SOCKET__APPEND                        0x00000200U
++#define KCM_SOCKET__MAP                           0x00000400U
++#define KCM_SOCKET__BIND                          0x00000800U
++#define KCM_SOCKET__CONNECT                       0x00001000U
++#define KCM_SOCKET__LISTEN                        0x00002000U
++#define KCM_SOCKET__ACCEPT                        0x00004000U
++#define KCM_SOCKET__GETOPT                        0x00008000U
++#define KCM_SOCKET__SETOPT                        0x00010000U
++#define KCM_SOCKET__SHUTDOWN                      0x00020000U
++#define KCM_SOCKET__RECVFROM                      0x00040000U
++#define KCM_SOCKET__SENDTO                        0x00080000U
++#define KCM_SOCKET__NAME_BIND                     0x00100000U
++#define QIPCRTR_SOCKET__IOCTL                     0x00000001U
++#define QIPCRTR_SOCKET__READ                      0x00000002U
++#define QIPCRTR_SOCKET__WRITE                     0x00000004U
++#define QIPCRTR_SOCKET__CREATE                    0x00000008U
++#define QIPCRTR_SOCKET__GETATTR                   0x00000010U
++#define QIPCRTR_SOCKET__SETATTR                   0x00000020U
++#define QIPCRTR_SOCKET__LOCK                      0x00000040U
++#define QIPCRTR_SOCKET__RELABELFROM               0x00000080U
++#define QIPCRTR_SOCKET__RELABELTO                 0x00000100U
++#define QIPCRTR_SOCKET__APPEND                    0x00000200U
++#define QIPCRTR_SOCKET__MAP                       0x00000400U
++#define QIPCRTR_SOCKET__BIND                      0x00000800U
++#define QIPCRTR_SOCKET__CONNECT                   0x00001000U
++#define QIPCRTR_SOCKET__LISTEN                    0x00002000U
++#define QIPCRTR_SOCKET__ACCEPT                    0x00004000U
++#define QIPCRTR_SOCKET__GETOPT                    0x00008000U
++#define QIPCRTR_SOCKET__SETOPT                    0x00010000U
++#define QIPCRTR_SOCKET__SHUTDOWN                  0x00020000U
++#define QIPCRTR_SOCKET__RECVFROM                  0x00040000U
++#define QIPCRTR_SOCKET__SENDTO                    0x00080000U
++#define QIPCRTR_SOCKET__NAME_BIND                 0x00100000U
++#define SMC_SOCKET__IOCTL                         0x00000001U
++#define SMC_SOCKET__READ                          0x00000002U
++#define SMC_SOCKET__WRITE                         0x00000004U
++#define SMC_SOCKET__CREATE                        0x00000008U
++#define SMC_SOCKET__GETATTR                       0x00000010U
++#define SMC_SOCKET__SETATTR                       0x00000020U
++#define SMC_SOCKET__LOCK                          0x00000040U
++#define SMC_SOCKET__RELABELFROM                   0x00000080U
++#define SMC_SOCKET__RELABELTO                     0x00000100U
++#define SMC_SOCKET__APPEND                        0x00000200U
++#define SMC_SOCKET__MAP                           0x00000400U
++#define SMC_SOCKET__BIND                          0x00000800U
++#define SMC_SOCKET__CONNECT                       0x00001000U
++#define SMC_SOCKET__LISTEN                        0x00002000U
++#define SMC_SOCKET__ACCEPT                        0x00004000U
++#define SMC_SOCKET__GETOPT                        0x00008000U
++#define SMC_SOCKET__SETOPT                        0x00010000U
++#define SMC_SOCKET__SHUTDOWN                      0x00020000U
++#define SMC_SOCKET__RECVFROM                      0x00040000U
++#define SMC_SOCKET__SENDTO                        0x00080000U
++#define SMC_SOCKET__NAME_BIND                     0x00100000U
++#define INFINIBAND_PKEY__ACCESS                   0x00000001U
++#define INFINIBAND_ENDPORT__MANAGE_SUBNET         0x00000001U
++#define BPF__MAP_CREATE                           0x00000001U
++#define BPF__MAP_READ                             0x00000002U
++#define BPF__MAP_WRITE                            0x00000004U
++#define BPF__PROG_LOAD                            0x00000008U
++#define BPF__PROG_RUN                             0x00000010U
++#define XDP_SOCKET__IOCTL                         0x00000001U
++#define XDP_SOCKET__READ                          0x00000002U
++#define XDP_SOCKET__WRITE                         0x00000004U
++#define XDP_SOCKET__CREATE                        0x00000008U
++#define XDP_SOCKET__GETATTR                       0x00000010U
++#define XDP_SOCKET__SETATTR                       0x00000020U
++#define XDP_SOCKET__LOCK                          0x00000040U
++#define XDP_SOCKET__RELABELFROM                   0x00000080U
++#define XDP_SOCKET__RELABELTO                     0x00000100U
++#define XDP_SOCKET__APPEND                        0x00000200U
++#define XDP_SOCKET__MAP                           0x00000400U
++#define XDP_SOCKET__BIND                          0x00000800U
++#define XDP_SOCKET__CONNECT                       0x00001000U
++#define XDP_SOCKET__LISTEN                        0x00002000U
++#define XDP_SOCKET__ACCEPT                        0x00004000U
++#define XDP_SOCKET__GETOPT                        0x00008000U
++#define XDP_SOCKET__SETOPT                        0x00010000U
++#define XDP_SOCKET__SHUTDOWN                      0x00020000U
++#define XDP_SOCKET__RECVFROM                      0x00040000U
++#define XDP_SOCKET__SENDTO                        0x00080000U
++#define XDP_SOCKET__NAME_BIND                     0x00100000U
++#define MCTP_SOCKET__IOCTL                        0x00000001U
++#define MCTP_SOCKET__READ                         0x00000002U
++#define MCTP_SOCKET__WRITE                        0x00000004U
++#define MCTP_SOCKET__CREATE                       0x00000008U
++#define MCTP_SOCKET__GETATTR                      0x00000010U
++#define MCTP_SOCKET__SETATTR                      0x00000020U
++#define MCTP_SOCKET__LOCK                         0x00000040U
++#define MCTP_SOCKET__RELABELFROM                  0x00000080U
++#define MCTP_SOCKET__RELABELTO                    0x00000100U
++#define MCTP_SOCKET__APPEND                       0x00000200U
++#define MCTP_SOCKET__MAP                          0x00000400U
++#define MCTP_SOCKET__BIND                         0x00000800U
++#define MCTP_SOCKET__CONNECT                      0x00001000U
++#define MCTP_SOCKET__LISTEN                       0x00002000U
++#define MCTP_SOCKET__ACCEPT                       0x00004000U
++#define MCTP_SOCKET__GETOPT                       0x00008000U
++#define MCTP_SOCKET__SETOPT                       0x00010000U
++#define MCTP_SOCKET__SHUTDOWN                     0x00020000U
++#define MCTP_SOCKET__RECVFROM                     0x00040000U
++#define MCTP_SOCKET__SENDTO                       0x00080000U
++#define MCTP_SOCKET__NAME_BIND                    0x00100000U
++#define PERF_EVENT__OPEN                          0x00000001U
++#define PERF_EVENT__CPU                           0x00000002U
++#define PERF_EVENT__KERNEL                        0x00000004U
++#define PERF_EVENT__TRACEPOINT                    0x00000008U
++#define PERF_EVENT__READ                          0x00000010U
++#define PERF_EVENT__WRITE                         0x00000020U
++#define ANON_INODE__IOCTL                         0x00000001U
++#define ANON_INODE__READ                          0x00000002U
++#define ANON_INODE__WRITE                         0x00000004U
++#define ANON_INODE__CREATE                        0x00000008U
++#define ANON_INODE__GETATTR                       0x00000010U
++#define ANON_INODE__SETATTR                       0x00000020U
++#define ANON_INODE__LOCK                          0x00000040U
++#define ANON_INODE__RELABELFROM                   0x00000080U
++#define ANON_INODE__RELABELTO                     0x00000100U
++#define ANON_INODE__APPEND                        0x00000200U
++#define ANON_INODE__MAP                           0x00000400U
++#define ANON_INODE__UNLINK                        0x00000800U
++#define ANON_INODE__LINK                          0x00001000U
++#define ANON_INODE__RENAME                        0x00002000U
++#define ANON_INODE__EXECUTE                       0x00004000U
++#define ANON_INODE__QUOTAON                       0x00008000U
++#define ANON_INODE__MOUNTON                       0x00010000U
++#define ANON_INODE__AUDIT_ACCESS                  0x00020000U
++#define ANON_INODE__OPEN                          0x00040000U
++#define ANON_INODE__EXECMOD                       0x00080000U
++#define ANON_INODE__WATCH                         0x00100000U
++#define ANON_INODE__WATCH_MOUNT                   0x00200000U
++#define ANON_INODE__WATCH_SB                      0x00400000U
++#define ANON_INODE__WATCH_WITH_PERM               0x00800000U
++#define ANON_INODE__WATCH_READS                   0x01000000U
++#define IO_URING__OVERRIDE_CREDS                  0x00000001U
++#define IO_URING__SQPOLL                          0x00000002U
++#define IO_URING__CMD                             0x00000004U
++#define USER_NAMESPACE__CREATE                    0x00000001U
++
++#endif
+diff --git a/security/selinux/include/flask.h b/security/selinux/include/flask.h
+new file mode 100644
+index 0000000000000..753d958399131
+--- /dev/null
++++ b/security/selinux/include/flask.h
+@@ -0,0 +1,189 @@
++/* This file is automatically generated.  Do not edit. */
++#ifndef _SELINUX_FLASK_H_
++#define _SELINUX_FLASK_H_
++
++#define SECCLASS_SECURITY                                 1
++#define SECCLASS_PROCESS                                  2
++#define SECCLASS_PROCESS2                                 3
++#define SECCLASS_SYSTEM                                   4
++#define SECCLASS_CAPABILITY                               5
++#define SECCLASS_FILESYSTEM                               6
++#define SECCLASS_FILE                                     7
++#define SECCLASS_DIR                                      8
++#define SECCLASS_FD                                       9
++#define SECCLASS_LNK_FILE                                10
++#define SECCLASS_CHR_FILE                                11
++#define SECCLASS_BLK_FILE                                12
++#define SECCLASS_SOCK_FILE                               13
++#define SECCLASS_FIFO_FILE                               14
++#define SECCLASS_SOCKET                                  15
++#define SECCLASS_TCP_SOCKET                              16
++#define SECCLASS_UDP_SOCKET                              17
++#define SECCLASS_RAWIP_SOCKET                            18
++#define SECCLASS_NODE                                    19
++#define SECCLASS_NETIF                                   20
++#define SECCLASS_NETLINK_SOCKET                          21
++#define SECCLASS_PACKET_SOCKET                           22
++#define SECCLASS_KEY_SOCKET                              23
++#define SECCLASS_UNIX_STREAM_SOCKET                      24
++#define SECCLASS_UNIX_DGRAM_SOCKET                       25
++#define SECCLASS_SEM                                     26
++#define SECCLASS_MSG                                     27
++#define SECCLASS_MSGQ                                    28
++#define SECCLASS_SHM                                     29
++#define SECCLASS_IPC                                     30
++#define SECCLASS_NETLINK_ROUTE_SOCKET                    31
++#define SECCLASS_NETLINK_TCPDIAG_SOCKET                  32
++#define SECCLASS_NETLINK_NFLOG_SOCKET                    33
++#define SECCLASS_NETLINK_XFRM_SOCKET                     34
++#define SECCLASS_NETLINK_SELINUX_SOCKET                  35
++#define SECCLASS_NETLINK_ISCSI_SOCKET                    36
++#define SECCLASS_NETLINK_AUDIT_SOCKET                    37
++#define SECCLASS_NETLINK_FIB_LOOKUP_SOCKET               38
++#define SECCLASS_NETLINK_CONNECTOR_SOCKET                39
++#define SECCLASS_NETLINK_NETFILTER_SOCKET                40
++#define SECCLASS_NETLINK_DNRT_SOCKET                     41
++#define SECCLASS_ASSOCIATION                             42
++#define SECCLASS_NETLINK_KOBJECT_UEVENT_SOCKET           43
++#define SECCLASS_NETLINK_GENERIC_SOCKET                  44
++#define SECCLASS_NETLINK_SCSITRANSPORT_SOCKET            45
++#define SECCLASS_NETLINK_RDMA_SOCKET                     46
++#define SECCLASS_NETLINK_CRYPTO_SOCKET                   47
++#define SECCLASS_APPLETALK_SOCKET                        48
++#define SECCLASS_PACKET                                  49
++#define SECCLASS_KEY                                     50
++#define SECCLASS_DCCP_SOCKET                             51
++#define SECCLASS_MEMPROTECT                              52
++#define SECCLASS_PEER                                    53
++#define SECCLASS_CAPABILITY2                             54
++#define SECCLASS_KERNEL_SERVICE                          55
++#define SECCLASS_TUN_SOCKET                              56
++#define SECCLASS_BINDER                                  57
++#define SECCLASS_CAP_USERNS                              58
++#define SECCLASS_CAP2_USERNS                             59
++#define SECCLASS_SCTP_SOCKET                             60
++#define SECCLASS_ICMP_SOCKET                             61
++#define SECCLASS_AX25_SOCKET                             62
++#define SECCLASS_IPX_SOCKET                              63
++#define SECCLASS_NETROM_SOCKET                           64
++#define SECCLASS_ATMPVC_SOCKET                           65
++#define SECCLASS_X25_SOCKET                              66
++#define SECCLASS_ROSE_SOCKET                             67
++#define SECCLASS_DECNET_SOCKET                           68
++#define SECCLASS_ATMSVC_SOCKET                           69
++#define SECCLASS_RDS_SOCKET                              70
++#define SECCLASS_IRDA_SOCKET                             71
++#define SECCLASS_PPPOX_SOCKET                            72
++#define SECCLASS_LLC_SOCKET                              73
++#define SECCLASS_CAN_SOCKET                              74
++#define SECCLASS_TIPC_SOCKET                             75
++#define SECCLASS_BLUETOOTH_SOCKET                        76
++#define SECCLASS_IUCV_SOCKET                             77
++#define SECCLASS_RXRPC_SOCKET                            78
++#define SECCLASS_ISDN_SOCKET                             79
++#define SECCLASS_PHONET_SOCKET                           80
++#define SECCLASS_IEEE802154_SOCKET                       81
++#define SECCLASS_CAIF_SOCKET                             82
++#define SECCLASS_ALG_SOCKET                              83
++#define SECCLASS_NFC_SOCKET                              84
++#define SECCLASS_VSOCK_SOCKET                            85
++#define SECCLASS_KCM_SOCKET                              86
++#define SECCLASS_QIPCRTR_SOCKET                          87
++#define SECCLASS_SMC_SOCKET                              88
++#define SECCLASS_INFINIBAND_PKEY                         89
++#define SECCLASS_INFINIBAND_ENDPORT                      90
++#define SECCLASS_BPF                                     91
++#define SECCLASS_XDP_SOCKET                              92
++#define SECCLASS_MCTP_SOCKET                             93
++#define SECCLASS_PERF_EVENT                              94
++#define SECCLASS_ANON_INODE                              95
++#define SECCLASS_IO_URING                                96
++#define SECCLASS_USER_NAMESPACE                          97
++
++#define SECINITSID_KERNEL                                   1
++#define SECINITSID_SECURITY                                 2
++#define SECINITSID_UNLABELED                                3
++#define SECINITSID_FILE                                     5
++#define SECINITSID_ANY_SOCKET                               8
++#define SECINITSID_PORT                                     9
++#define SECINITSID_NETIF                                   10
++#define SECINITSID_NETMSG                                  11
++#define SECINITSID_NODE                                    12
++#define SECINITSID_DEVNULL                                 27
++
++#define SECINITSID_NUM 27
++
++static inline bool security_is_socket_class(u16 kern_tclass)
++{
++	bool sock = false;
++
++	switch (kern_tclass) {
++	case SECCLASS_SOCKET:
++	case SECCLASS_TCP_SOCKET:
++	case SECCLASS_UDP_SOCKET:
++	case SECCLASS_RAWIP_SOCKET:
++	case SECCLASS_NETLINK_SOCKET:
++	case SECCLASS_PACKET_SOCKET:
++	case SECCLASS_KEY_SOCKET:
++	case SECCLASS_UNIX_STREAM_SOCKET:
++	case SECCLASS_UNIX_DGRAM_SOCKET:
++	case SECCLASS_NETLINK_ROUTE_SOCKET:
++	case SECCLASS_NETLINK_TCPDIAG_SOCKET:
++	case SECCLASS_NETLINK_NFLOG_SOCKET:
++	case SECCLASS_NETLINK_XFRM_SOCKET:
++	case SECCLASS_NETLINK_SELINUX_SOCKET:
++	case SECCLASS_NETLINK_ISCSI_SOCKET:
++	case SECCLASS_NETLINK_AUDIT_SOCKET:
++	case SECCLASS_NETLINK_FIB_LOOKUP_SOCKET:
++	case SECCLASS_NETLINK_CONNECTOR_SOCKET:
++	case SECCLASS_NETLINK_NETFILTER_SOCKET:
++	case SECCLASS_NETLINK_DNRT_SOCKET:
++	case SECCLASS_NETLINK_KOBJECT_UEVENT_SOCKET:
++	case SECCLASS_NETLINK_GENERIC_SOCKET:
++	case SECCLASS_NETLINK_SCSITRANSPORT_SOCKET:
++	case SECCLASS_NETLINK_RDMA_SOCKET:
++	case SECCLASS_NETLINK_CRYPTO_SOCKET:
++	case SECCLASS_APPLETALK_SOCKET:
++	case SECCLASS_DCCP_SOCKET:
++	case SECCLASS_TUN_SOCKET:
++	case SECCLASS_SCTP_SOCKET:
++	case SECCLASS_ICMP_SOCKET:
++	case SECCLASS_AX25_SOCKET:
++	case SECCLASS_IPX_SOCKET:
++	case SECCLASS_NETROM_SOCKET:
++	case SECCLASS_ATMPVC_SOCKET:
++	case SECCLASS_X25_SOCKET:
++	case SECCLASS_ROSE_SOCKET:
++	case SECCLASS_DECNET_SOCKET:
++	case SECCLASS_ATMSVC_SOCKET:
++	case SECCLASS_RDS_SOCKET:
++	case SECCLASS_IRDA_SOCKET:
++	case SECCLASS_PPPOX_SOCKET:
++	case SECCLASS_LLC_SOCKET:
++	case SECCLASS_CAN_SOCKET:
++	case SECCLASS_TIPC_SOCKET:
++	case SECCLASS_BLUETOOTH_SOCKET:
++	case SECCLASS_IUCV_SOCKET:
++	case SECCLASS_RXRPC_SOCKET:
++	case SECCLASS_ISDN_SOCKET:
++	case SECCLASS_PHONET_SOCKET:
++	case SECCLASS_IEEE802154_SOCKET:
++	case SECCLASS_CAIF_SOCKET:
++	case SECCLASS_ALG_SOCKET:
++	case SECCLASS_NFC_SOCKET:
++	case SECCLASS_VSOCK_SOCKET:
++	case SECCLASS_KCM_SOCKET:
++	case SECCLASS_QIPCRTR_SOCKET:
++	case SECCLASS_SMC_SOCKET:
++	case SECCLASS_XDP_SOCKET:
++	case SECCLASS_MCTP_SOCKET:
++		sock = true;
++		break;
++	default:
++		break;
++	}
++
++	return sock;
++}
++
++#endif
+-- 
+2.54.0
+

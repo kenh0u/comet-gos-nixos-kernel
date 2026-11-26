@@ -1,0 +1,40 @@
+From 0e29bb02e463d26d3e95258566b0893e14aa4c1d Mon Sep 17 00:00:00 2001
+From: kenh0u <21225079+kenh0u@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 09:25:28 +0900
+Subject: [PATCH 12/12] =?UTF-8?q?comet-nixos:=20CFI=5FPERMISSIVE=3Dy=20-?=
+ =?UTF-8?q?=20vendor=20module=20=E3=81=AE=20sysfs=20show=20CFI=20=E4=B8=8D?=
+ =?UTF-8?q?=E4=B8=80=E8=87=B4=E3=82=92=E5=AF=9B=E5=AE=B9=E5=8C=96?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Samsung vendor_dlkm 既定モジュール(ehld/exynos_pmu_if/usb_f_etr_miu 等)の
+sysfs show(dev_attr_show 経由)が CFI type 0xdf43c25c と合わず、onefetch 等が
+/proc,sysfs を読むたび Oops が連発(Oct-4/5 の panic はこれが Oops 連鎖の
+ 出発点; cf. filemap/irq パッチ bf56569/5e36f17)。
+PERMISSIVE で failure を WARN+許可にする(attr read は正常に通る)。
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ nixos_gki.fragment | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/nixos_gki.fragment b/nixos_gki.fragment
+index 64ee5ee7550d8..13922ac02d125 100644
+--- a/nixos_gki.fragment
++++ b/nixos_gki.fragment
+@@ -116,3 +116,11 @@ CONFIG_KSU=m
+ 
+ # ---- リリース文字列の短縮(64 文字制限対策, 2026-09-26) ----
+ # CONFIG_LOCALVERSION_AUTO is not set
++
++# ---- CFI: vender module との type hash 不一致を寛容に(2026-10-05) ----
++# Samsung の vendor_dlkm 既定モジュール(ehld, exynos_pmu_if, usb_f_etr_miu 等)の
++# sysfs show が dev_attr_show の CFI type 0xdf43c25c と合わず Oops が連発する
++# (Oct-4/5 の panic はこの Oops 連鎖が台風の目になって hard HANG に発展)。
++# PERMISSIVE にすると CFI 失敗が WARN(1 回許可して継続)になり、attr read は
++# 正常に通る。CFI 自体は有効のまま。
++CONFIG_CFI_PERMISSIVE=y
+-- 
+2.54.0
+

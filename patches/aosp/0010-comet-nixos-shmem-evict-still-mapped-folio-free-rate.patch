@@ -1,0 +1,100 @@
+From bf56569bdbbc4b462666736101ae57da6349edff Mon Sep 17 00:00:00 2001
+From: kenh0u <21225079+kenh0u@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:43:20 +0900
+Subject: [PATCH 10/12] =?UTF-8?q?comet-nixos:=20shmem=20evict=20=E3=81=AE?=
+ =?UTF-8?q?=20still-mapped=20folio=20=E3=82=92=20free=20=E3=81=97=E3=81=AA?=
+ =?UTF-8?q?=E3=81=84=20+=20=E5=87=BA=E5=8A=9B=20ratelimit=20=E5=8C=96?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+llvmpipe(GTK4-X11 の ghostty/chromium)の memfd-backed リソース(lp_dma_buf/
+allocation fd)の last close で shmem evict が mapcount>0 の folio を
+truncate し、filemap_unaccount_folio の invariant 違反(BUG: Bad page cache
+... still mapped when deleted)が GUI 使用中に大量発生(~600/スクロール churn)。
+
+upstream(v6.19)でも同じチェックのまま fix は無く、hugetlb 系の 6.1.155 fix
+は本経路と無関係。実機では専用 dump(1 イベント pr_alert+dump_page+dump_stack)
+と mapping_exiting 救済 free(page_mapcount_reset+folio_ref_sub が
+"VMA は全て破棄済み" を仮定して still-mapped folio を解放)が障害増幅に効いて
+Bad page state(mapcount:-1)を経て Oops - CFI: Fatal exception panic に至っていた。
+
+- 出力を ratelimit 化(60s あたり 3 件)
+- 救済 free を廃止(folio は leak するが出と解放に伴う汚染は消える)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mm/filemap.c | 56 ++++++++++++++++++++++++++++++++++------------------
+ 1 file changed, 37 insertions(+), 19 deletions(-)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index a664f1f8ae70f..5a7a04b22744f 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -172,26 +172,44 @@ static void filemap_unaccount_folio(struct address_space *mapping,
+ 
+ 	VM_BUG_ON_FOLIO(folio_mapped(folio), folio);
+ 	if (!IS_ENABLED(CONFIG_DEBUG_VM) && unlikely(folio_mapped(folio))) {
+-		pr_alert("BUG: Bad page cache in process %s  pfn:%05lx\n",
+-			 current->comm, folio_pfn(folio));
+-		dump_page(&folio->page, "still mapped when deleted");
+-		dump_stack();
+-		add_taint(TAINT_BAD_PAGE, LOCKDEP_NOW_UNRELIABLE);
+-
+-		if (mapping_exiting(mapping) && !folio_test_large(folio)) {
+-			int mapcount = page_mapcount(&folio->page);
+-
+-			if (folio_ref_count(folio) >= mapcount + 2) {
+-				/*
+-				 * All vmas have already been torn down, so it's
+-				 * a good bet that actually the page is unmapped
+-				 * and we'd rather not leak it: if we're wrong,
+-				 * another bad page check should catch it later.
+-				 */
+-				page_mapcount_reset(&folio->page);
+-				folio_ref_sub(folio, mapcount);
+-			}
++		/*
++		 * comet-nixos(2026-10-04): llvmpipe(GTK4-X11 の ghostty/chromium
++		 * が常時使う GL)の memfd-backed リソース("lp_dma_buf"/
++		 * "allocation fd")は、最後の fd close 時に shrink 系 lock を
++		 * 取らないがまま unlink され、shmem の evict(shmem_undo_range)
++		 * が mapcount>0 の folio を truncate してこの invariant 違反を
++		 * 大量に発生させる(実測 ~600/スクロール churn 1 cycle、
++		 *)。upstream(v6.19)でも同じチェックのまま
++		 * fix は無い(hugetlb 系の 6.1.155 fix は本経路と無関係)。
++		 *
++		 * 本体としては 2 つの事故が続いていた:
++		 *   (1) 1 イベントあたり pr_alert+dump_page+dump_stack が百回以上
++		 *       走り kswapd や GUI スレッドに長い stall が生じる
++		 *   (2) 後段の mapping_exiting による見込み付き救済 free
++		 *       (page_mapcount_reset + folio_ref_sub)が "全部 VMA は破棄
++		 *       済み" を仮定して、実際にはまだ map されている folio を解放
++		 *       し、Bad page state(mapcount:-1)以降の page state 汚染を
++		 *       経て "Oops - CFI: Fatal exception" panic(uptime 38h)に至る
++		 * 対応:
++		 *   - 出力は ratelimit 化(同一事件の連打を捨てるのみで、1 イベント
++		 *     の検知能力は失わない)
++		 *   - 救済 free はしない。folio は refcount 残置で leak するが、
++		 *     まだ map されている page を解放する事故は消える
++		 */
++		static DEFINE_RATELIMIT_STATE(_comet_badpage_rs, 60 * HZ, 3);
++
++		if (__ratelimit(&_comet_badpage_rs)) {
++			pr_alert("BUG: Bad page cache in process %s  pfn:%05lx (leaking; ratelimited)\n",
++				 current->comm, folio_pfn(folio));
++			dump_page(&folio->page, "still mapped when deleted");
++			dump_stack();
++			add_taint(TAINT_BAD_PAGE, LOCKDEP_NOW_UNRELIABLE);
+ 		}
++
++		/*
++		 * folio を free しない。refcount も mapcount も残す(芋づる式の
++		 * "Bad page state" → CFI fatal 実害を避ける)。
++		 */
+ 	}
+ 
+ 	/* hugetlb folios do not participate in page cache accounting. */
+-- 
+2.54.0
+

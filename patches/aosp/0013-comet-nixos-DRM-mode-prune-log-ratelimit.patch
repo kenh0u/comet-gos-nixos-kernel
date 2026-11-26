@@ -1,0 +1,107 @@
+From: kenh0u <kenh0u@users.noreply.github.com>
+Subject: [PATCH] comet-nixos: DRM mode prune ログの ratelimit 化
+
+0004 で追加した [cn-mode] 系 pr_info は connector x mode x 検証周期ごとに
+出るため、hotplug polling 動作中や mode set 失敗ループで dmesg が埋まる。
+filemap 側(bf56569)と同じく ratelimit(60s あたり 10 件)で連打を捨てる。
+検知能力(1 イベントの記録)は失わない。
+
+対象(0004 適用済み tree への追加差分):
+- drivers/gpu/drm/drm_modes.c: prune された mode の記録
+- drivers/gpu/drm/drm_probe_helper.c: encoder/bridge/crtc 拒否の記録
+---
+diff -uprN b/drivers/gpu/drm/drm_modes.c a/drivers/gpu/drm/drm_modes.c
+--- a/drivers/gpu/drm/drm_modes.c	2026-11-18 20:35:52.949563625 +0900
++++ b/drivers/gpu/drm/drm_modes.c	2026-11-18 20:36:06.651751184 +0900
+@@ -1340,10 +1340,15 @@ void drm_mode_prune_invalid(struct drm_d
+ 			if (verbose) {
+ 				drm_mode_debug_printmodeline(mode);
+ 				/* comet-nixos: prune されたモードを常時記録
+-				 * (GKI は dynamic debug 無効のため KMS dbg は出ない) */
+-				pr_info("[cn-mode] Not using %s mode: %s\n",
+-					mode->name,
+-					drm_get_mode_status_name(mode->status));
++				 * (GKI は dynamic debug 無効のため KMS dbg は出ない)。
++				 * ratelimit 化(2026-11-18): 検証周期ごとの連打で
++				 * dmesg が埋まるのを防ぐ */
++				static DEFINE_RATELIMIT_STATE(_cn_prune_rs, 60 * HZ, 10);
++
++				if (__ratelimit(&_cn_prune_rs))
++					pr_info("[cn-mode] Not using %s mode: %s\n",
++						mode->name,
++						drm_get_mode_status_name(mode->status));
+ 			}
+ 			drm_mode_destroy(dev, mode);
+ 		}
+diff -uprN b/drivers/gpu/drm/drm_probe_helper.c a/drivers/gpu/drm/drm_probe_helper.c
+--- a/drivers/gpu/drm/drm_probe_helper.c	2026-11-18 20:35:52.949563625 +0900
++++ b/drivers/gpu/drm/drm_probe_helper.c	2026-11-18 20:36:27.579865085 +0900
+@@ -67,6 +67,10 @@
+ static bool drm_kms_helper_poll = true;
+ module_param_named(poll, drm_kms_helper_poll, bool, 0600);
+ 
++/* comet-nixos: [cn-mode] 系ログの ratelimit(2026-11-18)。
++ * 検証周期ごとの連打で dmesg が埋まるのを防ぐ(1 イベントの記録は失われない) */
++static DEFINE_RATELIMIT_STATE(_cn_probe_rs, 60 * HZ, 10);
++
+ /* comet-nixos: cn_status_name() はヘッダ公開されていないため
+  * 計測ログ用の簡易変換をローカルに用意する */
+ static const char *cn_status_name(enum drm_mode_status status)
+@@ -138,9 +142,10 @@ drm_mode_validate_pipeline(struct drm_di
+ 			 * reject the mode then, at exit, ret will not be
+ 			 * MODE_OK. */
+ 			/* comet-nixos: encoder 側の拒否を記録 */
+-			pr_info("[cn-mode] %s encoder %s rejected: %s\n",
+-				connector->name, encoder->name,
+-				cn_status_name(*status));
++			if (__ratelimit(&_cn_probe_rs))
++				pr_info("[cn-mode] %s encoder %s rejected: %s\n",
++					connector->name, encoder->name,
++					cn_status_name(*status));
+ 			continue;
+ 		}
+ 
+@@ -152,10 +157,11 @@ drm_mode_validate_pipeline(struct drm_di
+ 			/* There is also no point in continuing for crtc check
+ 			 * here. */
+ 			/* comet-nixos: bridge 側の拒否を記録(bridge 無しは OK) */
+-			pr_info("[cn-mode] %s bridge rejected: %s\n",
+-				connector->name,
+-				bridge ? cn_status_name(*status) :
+-					 "MODE_OK(no bridge)");
++			if (__ratelimit(&_cn_probe_rs))
++				pr_info("[cn-mode] %s bridge rejected: %s\n",
++					connector->name,
++					bridge ? cn_status_name(*status) :
++						 "MODE_OK(no bridge)");
+ 			continue;
+ 		}
+ 
+@@ -171,17 +177,19 @@ drm_mode_validate_pipeline(struct drm_di
+ 				return 0;
+ 			}
+ 			/* comet-nixos: crtc 側の拒否を記録 */
+-			pr_info("[cn-mode] %s crtc %s rejected: %s\n",
+-				connector->name, crtc->name,
+-				cn_status_name(*status));
++			if (__ratelimit(&_cn_probe_rs))
++				pr_info("[cn-mode] %s crtc %s rejected: %s\n",
++					connector->name, crtc->name,
++					cn_status_name(*status));
+ 		}
+ 	}
+ 
+ 	/* comet-nixos: encoder+crtc の組合せが 1 つも見つからなかった場合。
+ 	 * *status は最後の判定結果のまま(全ての段を MODE_OK で抜けると
+ 	 * MODE_OK のまま return 0 するため、実は prune されない)。 */
+-	pr_info("[cn-mode] %s no encoder+crtc accepted (status=%s)\n",
+-		connector->name, cn_status_name(*status));
++	if (__ratelimit(&_cn_probe_rs))
++		pr_info("[cn-mode] %s no encoder+crtc accepted (status=%s)\n",
++			connector->name, cn_status_name(*status));
+ 
+ 	return 0;
+ }
+
+-- 
+2.54.0

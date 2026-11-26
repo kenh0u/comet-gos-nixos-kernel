@@ -1,0 +1,38 @@
+diff --git a/private/devices/google/comet/BUILD.bazel b/private/devices/google/comet/BUILD.bazel
+index 6c69917d..d97358ec 100644
+--- a/private/devices/google/comet/BUILD.bazel
++++ b/private/devices/google/comet/BUILD.bazel
+@@ -5,6 +5,14 @@ load("//private/devices/google/zuma:constants.bzl", "ZUMA_DTBS")
+ load("//private/devices/google/zumapro:constants.bzl", "ZUMAPRO_DTBS", "ZUMAPRO_MODULE_OUTS")
+ load(":constants.bzl", "COMET_DTBOS")
+ 
++# comet-nixos: コンテナ拡張フラグメント(provision defconfig fragment)
++filegroup(
++    name = "nixos_gki_fragment",
++    srcs = ["nixos_gki.fragment"],
++)
++
++
++
+ device_build(
+     name = "comet",
+     base_device = "//private/devices/google/zumapro:zumapro_base",
+@@ -14,7 +22,7 @@ device_build(
+     build_system_dlkm = True,
+     build_vendor_dlkm = True,
+     build_vendor_kernel_boot = True,
+-    defconfig_fragments = ["comet_defconfig"],
++    defconfig_fragments = ["comet_defconfig", "nixos_gki_fragment"],
+     dtb_outs = ZUMA_DTBS + ZUMAPRO_DTBS,
+     dtbo_outs = COMET_DTBOS,
+     dts_makefile = "dts/Makefile",
+diff --git a/private/devices/google/comet/device.bazelrc b/private/devices/google/comet/device.bazelrc
+index 7e62694f..766a1481 100644
+--- a/private/devices/google/comet/device.bazelrc
++++ b/private/devices/google/comet/device.bazelrc
+@@ -4,3 +4,5 @@
+ 
+ build:comet --config=zumapro_base
+ build:comet --//private/devices/google/common:kernel=//private/devices/google/comet:comet/kernel
++build:comet --defconfig_fragment=//private/devices/google/comet:nixos_gki_fragment
++build:comet --action_env=PATH=/bin:/usr/bin:/usr/sbin:/usr/local/bin:/run/current-system/sw/bin:/home/kenhou/.nix-profile/bin

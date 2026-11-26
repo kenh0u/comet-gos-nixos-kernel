@@ -1,0 +1,68 @@
+From 5e36f178f1b15ba0ef9cb4d34340cf04d0e10e9a Mon Sep 17 00:00:00 2001
+From: kenh0u <21225079+kenh0u@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 02:38:16 +0900
+Subject: [PATCH 11/12] =?UTF-8?q?comet-nixos:=20irq=20affinity=5Fhint=20?=
+ =?UTF-8?q?=E3=81=AE=E8=AA=AD=E3=81=BF=E5=87=BA=E3=81=97=E3=82=92=20fault-?=
+ =?UTF-8?q?tolerant=20=E3=81=AB(panic=20=E5=AF=BE=E7=AD=96)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+irq_affinity_hint_proc_show の cpumask_copy が無効 hint pointer(稀に pte=0 の
+linear map 領域)を read して Oops → 複数 CPU で Oops/Cフィ連鎖 →
+Watchdog hard HANG panic した(実機 2026-10-05,
+/proc/irq/* を一気に読むのが trigger)。
+
+copy_from_kernel_nofault(存在しない mapping は -EFAULT で空 mask にする)
+に変えた。誤 hint は表示がおかしくなるだけ。first-hand panic は防がれる。
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ kernel/irq/proc.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/irq/proc.c b/kernel/irq/proc.c
+index 623b8136e9af3..52148bd2278ed 100644
+--- a/kernel/irq/proc.c
++++ b/kernel/irq/proc.c
+@@ -12,6 +12,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/mutex.h>
++#include <linux/uaccess.h>
+ 
+ #include "internals.h"
+ 
+@@ -90,8 +91,27 @@ static int irq_affinity_hint_proc_show(struct seq_file *m, void *v)
+ 		return -ENOMEM;
+ 
+ 	raw_spin_lock_irqsave(&desc->lock, flags);
+-	if (desc->affinity_hint)
+-		cpumask_copy(mask, desc->affinity_hint);
++	if (desc->affinity_hint) {
++		/*
++		 * comet-nixos(2026-10-05): ここでの cpumask_copy(desc->affinity_hint)
++		 * が実機で panics を出した。
++		 *   - Oct-4: "Oops - CFI: Fatal exception" (dev_attr_show)
++		 *   - Oct-5: irq_affinity_hint_proc_show+0x98(__memcpy) の
++		 *     level-3 translation fault(pte=0 の linear map アドレス
++		 *     ffffffc00895b9b0 を read) → 複数 CPU の Oops 連鎖 →
++		 *     "Watchdog detected hard HANG on cpu 5" で panic
++		 * trigger は onefetch(/proc/irq 配下の smp_affinity 系を一気に
++		 * 読む)だが、本体は hint pointer が無効(struct はドライバ/
++		 * モジュール側の自由)なことで、lock descent では防げない。
++		 * fault-tolerant copy(copy_from_kernel_nofault)で無効 pointer
++		 * は空 mask として読む。
++		 * 誤った hint が入っていても panic は出ない(表示が無効な mask
++		 * になるだけ)。
++		 */
++		if (copy_from_kernel_nofault(mask, desc->affinity_hint,
++					     cpumask_size()) < 0)
++			cpumask_clear(mask);
++	}
+ 	raw_spin_unlock_irqrestore(&desc->lock, flags);
+ 
+ 	seq_printf(m, "%*pb\n", cpumask_pr_args(mask));
+-- 
+2.54.0
+

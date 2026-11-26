@@ -1,0 +1,642 @@
+From 0a26600923cde5ecf76f19fb639df40f0d553872 Mon Sep 17 00:00:00 2001
+From: kenh0u <21225079+kenh0u@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 23:05:30 +0900
+Subject: [PATCH 02/12] =?UTF-8?q?comet-nixos:=20GKI=20fragment=20=E3=82=92?=
+ =?UTF-8?q?=E6=9C=80=E5=B0=8F=E5=8C=96(namespace=20=E3=81=AE=E3=81=BF)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+公式 LOS nightly カーネル(6.1.145)では Wi-Fi が正常動作する一方、
+自前カーネル(=y 多用の fragment)ではスキャンが BCME_EPERM で拒否される
+ことが判明したため、fragment を最小化する。
+
+- =y 化はコンテナで使う namespace のみ: USER_NS / PID_NS
+  (NAMESPACES/UTS_NS/NET_NS は GKI 既定 =y、IPC_NS は不使用)
+- CGROUP 系は GKI 既定のまま(Android 自身が必須)
+- コンソール/FB 系・USB シリアル等の組込み化は全廃止(=m に戻す)
+  それに伴い modules.bzl を stock に復元、KMI 追加リストも削除
+---
+ BUILD.bazel                         |   9 +-
+ android/abi_gki_aarch64_comet_nixos |   3 -
+ modules.bzl                         |  25 +-
+ nixos_gki.fragment                  | 498 +---------------------------
+ 4 files changed, 36 insertions(+), 499 deletions(-)
+ delete mode 100644 android/abi_gki_aarch64_comet_nixos
+
+diff --git a/BUILD.bazel b/BUILD.bazel
+index b339475e6fb64..ad00f81945b88 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -103,9 +103,6 @@ filegroup(
+         "android/abi_gki_aarch64_asr",
+         "android/abi_gki_aarch64_asus",
+         "android/abi_gki_aarch64_bcmstb",
+-        # comet-nixos: CONFIG_FB=y(DRM_FBDEV_EMULATION)化に伴い、ベンダーの
+-        # タッチドライバ(goodix/synaptics等)が fb_notifier を使うために必要
+-        "android/abi_gki_aarch64_comet_nixos",
+         "android/abi_gki_aarch64_db845c",
+         "android/abi_gki_aarch64_exynos",
+         "android/abi_gki_aarch64_exynosauto",
+@@ -139,8 +136,7 @@ filegroup(
+     visibility = ["//visibility:public"],
+ )
+ 
+-# Pixel 9 Pro Fold (comet) 向け NixOS/コンテナ拡張設定フラグメント
+-# （USBシリアル/Ethernet/CANの内蔵化、VT/fbcon、pstore、namespace完全化など）
++# Pixel 9 Pro Fold (comet) 向けコンテナ拡張フラグメント(最小化: namespace のみ)
+ filegroup(
+     name = "nixos_gki_fragment",
+     srcs = ["nixos_gki.fragment"],
+@@ -148,8 +144,7 @@ filegroup(
+ 
+ define_common_kernels(target_configs = {
+     "kernel_aarch64": {
+-        # 独自拡張のため KMI 厳格チェックを無効化（シンボルリストへの追加のみ行う）
+-        "kmi_symbol_list_strict_mode": False,
++        "kmi_symbol_list_strict_mode": True,
+         "module_implicit_outs": get_gki_modules_list("arm64"),
+         "kmi_symbol_list": "android/abi_gki_aarch64",
+         "rewrite_absolute_paths_in_config": True,
+diff --git a/android/abi_gki_aarch64_comet_nixos b/android/abi_gki_aarch64_comet_nixos
+deleted file mode 100644
+index ada14807ae729..0000000000000
+--- a/android/abi_gki_aarch64_comet_nixos
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[abi_symbol_list]
+-  fb_register_client
+-  fb_unregister_client
+diff --git a/modules.bzl b/modules.bzl
+index 752f39e042ac8..52d92225aab4c 100644
+--- a/modules.bzl
++++ b/modules.bzl
+@@ -6,8 +6,6 @@ This module contains a full list of kernel modules
+  compiled by GKI.
+ """
+ 
+-# NOTE(comet-nixos): USBシリアル/CDC-ACM/USB Ethernet/CAN/WWAN は
+-# nixos_gki.fragment でカーネル組込み(=y)化したため、このリストから除去した。
+ _COMMON_GKI_MODULES_LIST = [
+     # keep sorted
+     "drivers/block/zram/zram.ko",
+@@ -15,6 +13,10 @@ _COMMON_GKI_MODULES_LIST = [
+     "drivers/bluetooth/btqca.ko",
+     "drivers/bluetooth/btsdio.ko",
+     "drivers/bluetooth/hci_uart.ko",
++    "drivers/net/can/dev/can-dev.ko",
++    "drivers/net/can/slcan/slcan.ko",
++    "drivers/net/can/vcan.ko",
++    "drivers/net/mii.ko",
+     "drivers/net/ppp/bsd_comp.ko",
+     "drivers/net/ppp/ppp_deflate.ko",
+     "drivers/net/ppp/ppp_generic.ko",
+@@ -22,6 +24,20 @@ _COMMON_GKI_MODULES_LIST = [
+     "drivers/net/ppp/pppox.ko",
+     "drivers/net/ppp/pptp.ko",
+     "drivers/net/slip/slhc.ko",
++    "drivers/net/usb/aqc111.ko",
++    "drivers/net/usb/asix.ko",
++    "drivers/net/usb/ax88179_178a.ko",
++    "drivers/net/usb/cdc_eem.ko",
++    "drivers/net/usb/cdc_ether.ko",
++    "drivers/net/usb/cdc_ncm.ko",
++    "drivers/net/usb/r8152.ko",
++    "drivers/net/usb/r8153_ecm.ko",
++    "drivers/net/usb/rtl8150.ko",
++    "drivers/net/usb/usbnet.ko",
++    "drivers/net/wwan/wwan.ko",
++    "drivers/usb/class/cdc-acm.ko",
++    "drivers/usb/serial/ftdi_sio.ko",
++    "drivers/usb/serial/usbserial.ko",
+     "kernel/kheaders.ko",
+     "lib/crypto/libarc4.ko",
+     "mm/zsmalloc.ko",
+@@ -37,6 +53,10 @@ _COMMON_GKI_MODULES_LIST = [
+     "net/bluetooth/bluetooth.ko",
+     "net/bluetooth/hidp/hidp.ko",
+     "net/bluetooth/rfcomm/rfcomm.ko",
++    "net/can/can.ko",
++    "net/can/can-bcm.ko",
++    "net/can/can-gw.ko",
++    "net/can/can-raw.ko",
+     "net/ieee802154/6lowpan/ieee802154_6lowpan.ko",
+     "net/ieee802154/ieee802154.ko",
+     "net/ieee802154/ieee802154_socket.ko",
+@@ -44,6 +64,7 @@ _COMMON_GKI_MODULES_LIST = [
+     "net/l2tp/l2tp_ppp.ko",
+     "net/mac802154/mac802154.ko",
+     "net/nfc/nfc.ko",
++    "net/rfkill/rfkill.ko",
+     "net/tipc/diag.ko",
+     "net/tipc/tipc.ko",
+ ]
+diff --git a/nixos_gki.fragment b/nixos_gki.fragment
+index 465c45f51605e..bb2e0ea35a4af 100644
+--- a/nixos_gki.fragment
++++ b/nixos_gki.fragment
+@@ -1,490 +1,14 @@
+-# nixos_gki.fragment — Pixel 9 Pro Fold (comet) 向け NixOS/コンテナ拡張GKI設定
++# nixos_gki.fragment — comet-nixos コンテナ拡張(最小化版)
+ #
+-# 方針:
+-#   - 既存の =m エントリは原則変更しない（GKI module_implicit_outs と整合させるため）。
+-#     例外は「外部接続ファミリ」（USBシリアル / CDC-ACM / USB Ethernet / CAN / WWAN）のみ
+-#     =y に格上げし、該当 .ko は aosp/modules.bzl から除去する（同時適用パッチで対応）。
+-#   - 上記以外はすべて「現状無効(=n)の項目を追加で有効化」する純追加設定。
+-#   - Android本体の動作に必須のサブシステム（SELinux/Binder/DRM/vendor module類）には手を触れない。
++# 方針 :
++#   - =y 化はコンテナで実際に使う namespace のみ。
++#     NAMESPACES/UTS_NS/IPC_NS/NET_NS は GKI 既定で =y のため触らない
++#     (NET_NS は host モード運用のため分離も使わない)
++#   - CGROUPS/MEMCG/CGROUP_SCHED/CPUSETS は GKI 既定 =y のまま放置
++#     (Android 自身が必須。コンテナでは cgroup を使わない)
++#   - コンソール/FB 系・USB シリアル等の組込み化は全廃止(標準 GKI 構成に戻す)
+ #
+-# 目的:
+-#   1) finit + NixOS コンテナ常駐に必要な namespace/cgroup/seccomp/鍵管理の完全化
+-#   2) VT + fbcon によるプライマリ画面へのカーネルメッセージ直接表示
+-#   3) pstore/ramoops によるパニックログ保全（zumapro-rmem.dtsi の予約領域と組み合わせ）
+-#   4) USBシリアル・USB Ethernet・CAN 等、組み込み/デスクトップ開発用ドライバの網羅的組込み
+-
+-##
+-## 1. コンテナ・名前空間基盤（非特権コンテナ / finit / systemd要件）
+-##
+-CONFIG_USER_NS=y
++# PID_NS は gki_defconfig で明示的に =n されているため =y へ変更
+ CONFIG_PID_NS=y
+-CONFIG_IPC_NS=y
+-CONFIG_NET_NS=y
+-CONFIG_UTS_NS=y
+-CONFIG_SYSVIPC=y
+-CONFIG_SYSVIPC_SYSCTL=y
+-CONFIG_POSIX_MQUEUE=y
+-CONFIG_POSIX_MQUEUE_SYSCTL=y
+-CONFIG_CGROUP_DEVICE=y
+-CONFIG_CGROUP_MISC=y
+-CONFIG_CGROUP_PERF=y
+-CONFIG_CGROUP_HUGETLB=y
+-CONFIG_CHECKPOINT_RESTORE=y
+-CONFIG_SECCOMP=y
+-CONFIG_SECCOMP_FILTER=y
+-CONFIG_KEYS=y
+-CONFIG_PERSISTENT_KEYRINGS=y
+-CONFIG_BIG_KEYS=y
+-CONFIG_KEY_DH_OPERATIONS=y
+-CONFIG_ENCRYPTED_KEYS=y
+-CONFIG_FANOTIFY=y
+-CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y
+-CONFIG_QUOTA=y
+-CONFIG_QUOTA_NETLINK_INTERFACE=y
+-CONFIG_AUTOFS_FS=y
+-CONFIG_CUSE=y
+-
+-##
+-## 2. VT / フレームバッファコンソール（dmesgをプライマリ画面に直接表示）
+-##    カーネルcmdlineに console=tty0 を追加（デバイスツリー側パッチで対応）
+-##
+-CONFIG_FONTS=y
+-CONFIG_VT=y
+-CONFIG_VT_CONSOLE=y
+-CONFIG_VT_HW_CONSOLE_BINDING=y
+-CONFIG_FB=y
+-CONFIG_DUMMY_CONSOLE=y
+-CONFIG_FRAMEBUFFER_CONSOLE=y
+-CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
+-CONFIG_FRAMEBUFFER_CONSOLE_ROTATION=y
+-CONFIG_FONT_8x8=y
+-CONFIG_FONT_8x16=y
+-CONFIG_FONT_6x11=y
+-CONFIG_FONT_7x14=y
+-CONFIG_FONT_10x18=y
+-CONFIG_FONT_TER16x32=y
+-CONFIG_DRM_FBDEV_EMULATION=y
+-
+-##
+-## 3. pstore / ramoops（初期パニックログのRAM退避 → /sys/fs/pstore）
+-##
+-CONFIG_PSTORE=y
+-CONFIG_PSTORE_CONSOLE=y
+-CONFIG_PSTORE_PMSG=y
+-CONFIG_PSTORE_RAM=y
+-
+-##
+-## 4. USBシリアル全種（=y 格上げ + 在るだけ全部追加）
+-##    ※ usbserial.ko / ftdi_sio.ko は modules.bzl から除去
+-##
+-CONFIG_USB_SERIAL=y
+-CONFIG_USB_SERIAL_CONSOLE=y
+-CONFIG_USB_SERIAL_GENERIC=y
+-CONFIG_USB_SERIAL_SIMPLE=y
+-CONFIG_USB_SERIAL_AIRCABLE=y
+-CONFIG_USB_SERIAL_ARK3116=y
+-CONFIG_USB_SERIAL_BELKIN=y
+-CONFIG_USB_SERIAL_CH341=y
+-CONFIG_USB_SERIAL_CP210X=y
+-CONFIG_USB_SERIAL_CYBERJACK=y
+-CONFIG_USB_SERIAL_CYPRESS_M8=y
+-CONFIG_USB_SERIAL_DIGI_ACCELEPORT=y
+-CONFIG_USB_SERIAL_EDGEPORT=y
+-CONFIG_USB_SERIAL_EDGEPORT_TI=y
+-CONFIG_USB_SERIAL_EMPEG=y
+-CONFIG_USB_SERIAL_F81232=y
+-CONFIG_USB_SERIAL_F8153X=y
+-CONFIG_USB_SERIAL_FTDI_SIO=y
+-CONFIG_USB_SERIAL_GARMIN=y
+-CONFIG_USB_SERIAL_IPAQ=y
+-CONFIG_USB_SERIAL_IPW=y
+-CONFIG_USB_SERIAL_IR=y
+-CONFIG_USB_SERIAL_IUU=y
+-CONFIG_USB_SERIAL_KEYSPAN=y
+-CONFIG_USB_SERIAL_KEYSPAN_PDA=y
+-CONFIG_USB_SERIAL_KLSI=y
+-CONFIG_USB_SERIAL_KOBIL_SCT=y
+-CONFIG_USB_SERIAL_MCT_U232=y
+-CONFIG_USB_SERIAL_METRO=y
+-CONFIG_USB_SERIAL_MOS7720=y
+-CONFIG_USB_SERIAL_MOS7840=y
+-CONFIG_USB_SERIAL_MXUPORT=y
+-CONFIG_USB_SERIAL_NAVMAN=y
+-CONFIG_USB_SERIAL_OMNINET=y
+-CONFIG_USB_SERIAL_OPTICON=y
+-CONFIG_USB_SERIAL_OPTION=y
+-CONFIG_USB_SERIAL_OTI6858=y
+-CONFIG_USB_SERIAL_PL2303=y
+-CONFIG_USB_SERIAL_QCAUX=y
+-CONFIG_USB_SERIAL_QUALCOMM=y
+-CONFIG_USB_SERIAL_QT2=y
+-CONFIG_USB_SERIAL_SAFE=y
+-CONFIG_USB_SERIAL_SAFE_PADDED=y
+-CONFIG_USB_SERIAL_SIERRAWIRELESS=y
+-CONFIG_USB_SERIAL_SPCP8X5=y
+-CONFIG_USB_SERIAL_SYMBOL=y
+-CONFIG_USB_SERIAL_TI=y
+-CONFIG_USB_SERIAL_UPD78F0730=y
+-CONFIG_USB_SERIAL_VISOR=y
+-CONFIG_USB_SERIAL_WHITEHEAT=y
+-CONFIG_USB_SERIAL_WISHBONE=y
+-CONFIG_USB_SERIAL_WWAN=y
+-CONFIG_USB_SERIAL_XR=y
+-CONFIG_USB_SERIAL_XSENS_MT=y
+-CONFIG_USB_ACM=y
+-CONFIG_USB_WDM=y
+-CONFIG_USB_PRINTER=y
+-CONFIG_USB_TMC=y
+-
+-##
+-## 5. USB Ethernet 全種（=y 格上げ + 在るだけ全部追加）
+-##    ※ usbnet.ko 等ファミリは modules.bzl から除去
+-##
+-CONFIG_MII=y
+-CONFIG_USB_NET_DRIVERS=y
+-CONFIG_USB_USBNET=y
+-CONFIG_USB_CATC=y
+-CONFIG_USB_KAWETH=y
+-CONFIG_USB_PEGASUS=y
+-CONFIG_USB_RTL8150=y
+-CONFIG_USB_RTL8152=y
+-CONFIG_USB_RTL8153_ECM=y
+-CONFIG_USB_LAN78XX=y
+-CONFIG_USB_NET_AX8817X=y
+-CONFIG_USB_NET_AX88179_178A=y
+-CONFIG_USB_NET_CDCETHER=y
+-CONFIG_USB_NET_CDC_EEM=y
+-CONFIG_USB_NET_CDC_NCM=y
+-CONFIG_USB_NET_HUAWEI_CDC_NCM=y
+-CONFIG_USB_NET_CDC_MBIM=y
+-CONFIG_USB_NET_CDC_SUBSET=y
+-CONFIG_USB_NET_CDC_SUBSET_ENABLE=y
+-CONFIG_USB_NET_NET1080=y
+-CONFIG_USB_NET_PLUSB=y
+-CONFIG_USB_NET_MCS7830=y
+-CONFIG_USB_NET_RNDIS_HOST=y
+-CONFIG_USB_NET_ZAURUS=y
+-CONFIG_USB_NET_CX82310_ETH=y
+-CONFIG_USB_NET_KALMIA=y
+-CONFIG_USB_NET_QMI_WWAN=y
+-CONFIG_USB_NET_DM9601=y
+-CONFIG_USB_NET_SR9700=y
+-CONFIG_USB_NET_SR9800=y
+-CONFIG_USB_NET_CH9200=y
+-CONFIG_USB_NET_INT51X1=y
+-CONFIG_USB_NET_AQC111=y
+-CONFIG_RFKILL=y
+-CONFIG_USB_HSO=y
+-CONFIG_USB_IPHETH=y
+-CONFIG_USB_SIERRA_NET=y
+-CONFIG_USB_VL600=y
+-CONFIG_PHONET=y
+-CONFIG_USB_CDC_PHONET=y
+-CONFIG_WWAN=y
+-CONFIG_WWAN_HWSIM=y
+-
+-##
+-## 6. CAN 全種（=y 格上げ + USB CANアダプタ追加）
+-##    ※ can*.ko / vcan.ko / slcan.ko / can-dev.ko は modules.bzl から除去
+-##
+-CONFIG_CAN=y
+-CONFIG_CAN_RAW=y
+-CONFIG_CAN_BCM=y
+-CONFIG_CAN_GW=y
+-CONFIG_CAN_J1939=y
+-CONFIG_CAN_ISOTP=y
+-CONFIG_CAN_VCAN=y
+-CONFIG_CAN_VXCAN=y
+-CONFIG_CAN_SLCAN=y
+-CONFIG_CAN_DEV=y
+-CONFIG_CAN_CALC_BITTIMING=y
+-CONFIG_CAN_GS_USB=y
+-CONFIG_CAN_KVASER_USB=y
+-CONFIG_CAN_PEAK_USB=y
+-CONFIG_CAN_EMS_USB=y
+-CONFIG_CAN_ESD_USB=y
+-CONFIG_CAN_8DEV_USB=y
+-CONFIG_CAN_MCBA_USB=y
+-CONFIG_CAN_ETAS_ES58X=y
+-CONFIG_CAN_UCAN=y
+-CONFIG_CAN_SOFTING=y
+-
+-##
+-## 7. 追加ネットワーク（コンテナ間通信・VM・診断・VPN）
+-##
+-CONFIG_DUMMY=y
+-CONFIG_IFB=y
+-CONFIG_MACVLAN=y
+-CONFIG_MACVTAP=y
+-CONFIG_IPVLAN=y
+-CONFIG_IPVTAP=y
+-CONFIG_VXLAN=y
+-CONFIG_GENEVE=y
+-CONFIG_NET_UDP_TUNNEL=y
+-CONFIG_NET_FOU=y
+-CONFIG_NET_FOU_IP_TUNNELS=y
+-CONFIG_BRIDGE_VLAN_FILTERING=y
+-CONFIG_BRIDGE_NETFILTER=y
+-CONFIG_NETFILTER_XT_MATCH_PHYSDEV=y
+-CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+-CONFIG_NETFILTER_XT_MATCH_CPU=y
+-CONFIG_NETFILTER_XT_SET=y
+-CONFIG_IP_SET=y
+-CONFIG_IP_SET_BITMAP_IP=y
+-CONFIG_IP_SET_BITMAP_IPMAC=y
+-CONFIG_IP_SET_BITMAP_PORT=y
+-CONFIG_IP_SET_HASH_IP=y
+-CONFIG_IP_SET_HASH_IPMARK=y
+-CONFIG_IP_SET_HASH_IPPORT=y
+-CONFIG_IP_SET_HASH_IPPORTIP=y
+-CONFIG_IP_SET_HASH_IPPORTNET=y
+-CONFIG_IP_SET_HASH_MAC=y
+-CONFIG_IP_SET_HASH_NET=y
+-CONFIG_IP_SET_HASH_NETNET=y
+-CONFIG_IP_SET_HASH_NETPORT=y
+-CONFIG_IP_SET_HASH_NETPORTNET=y
+-CONFIG_IP_SET_LIST_SET=y
+-CONFIG_NF_TABLES=y
+-CONFIG_NF_TABLES_INET=y
+-CONFIG_NF_TABLES_NETDEV=y
+-CONFIG_NFT_LOG=y
+-CONFIG_NFT_LIMIT=y
+-CONFIG_NFT_MASQ=y
+-CONFIG_NFT_NAT=y
+-CONFIG_NFT_REJECT=y
+-CONFIG_NFT_REJECT_INET=y
+-CONFIG_NFT_COMPAT=y
+-CONFIG_NFT_HASH=y
+-CONFIG_NF_FLOW_TABLE=y
+-CONFIG_NF_FLOW_TABLE_INET=y
+-CONFIG_NFT_FIB_IPV4=y
+-CONFIG_NFT_FIB_IPV6=y
+-CONFIG_NFT_FIB_INET=y
+-CONFIG_NFT_SOCKET=y
+-CONFIG_NFT_TPROXY=y
+-CONFIG_NFT_QUOTA=y
+-CONFIG_NFT_OBJREF=y
+-CONFIG_XFRM_USER=y
+-CONFIG_XFRM_SUB_POLICY=y
+-CONFIG_XFRM_MIGRATE=y
+-CONFIG_XFRM_STATISTICS=y
+-CONFIG_INET_ESP=y
+-CONFIG_INET_AH=y
+-CONFIG_INET_IPCOMP=y
+-CONFIG_INET_DIAG=y
+-CONFIG_INET_TCP_DIAG=y
+-CONFIG_INET_UDP_DIAG=y
+-CONFIG_INET_RAW_DIAG=y
+-CONFIG_IP_VS=y
+-CONFIG_NET_SCH_CAKE=y
+-CONFIG_NET_SCH_HFSC=y
+-CONFIG_NET_SCH_DRR=y
+-CONFIG_NET_SCH_QFQ=y
+-CONFIG_NET_SCH_PIE=y
+-CONFIG_NET_SCH_FQ_PIE=y
+-CONFIG_NET_CLS_FLOWER=y
+-CONFIG_NET_EMATCH_IPSET=y
+-CONFIG_NET_ACT_CSUM=y
+-CONFIG_NET_ACT_VLAN=y
+-CONFIG_NET_ACT_PEDIT=y
+-CONFIG_NET_ACT_TUNNEL_KEY=y
+-CONFIG_NET_ACT_CT=y
+-CONFIG_TCP_CONG_ADVANCED=y
+-CONFIG_TCP_CONG_BBR=y
+-# TCP_CONG_ADVANCED=y により Kconfig 既定で =m になる3種を =y に格上げ
+-# （modules.bzl の GKI モジュールリストに無いため、=m のままだと
+-#   「built but not copied」エラーでビルドが失敗する）
+-CONFIG_TCP_CONG_BIC=y
+-CONFIG_TCP_CONG_HTCP=y
+-CONFIG_TCP_CONG_WESTWOOD=y
+-CONFIG_MACSEC=y
+-CONFIG_NETCONSOLE=y
+-CONFIG_VSOCKETS=y
+-CONFIG_VSOCKETS_DIAG=y
+-CONFIG_VIRTIO_VSOCKETS=y
+-CONFIG_XDP_SOCKETS=y
+-CONFIG_XDP_SOCKETS_DIAG=y
+-CONFIG_PACKET_DIAG=y
+-CONFIG_UNIX_DIAG=y
+-CONFIG_NETLINK_DIAG=y
+-CONFIG_TLS=y
+-CONFIG_TLS_DEVICE=y
+-
+-##
+-## 8. ストレージ・ファイルシステム（NixOS rootfs選択肢の網羅）
+-##
+-CONFIG_SQUASHFS=y
+-CONFIG_SQUASHFS_FILE_CACHE=y
+-CONFIG_SQUASHFS_DECOMP_MULTI=y
+-CONFIG_SQUASHFS_XATTR=y
+-CONFIG_SQUASHFS_LZ4=y
+-CONFIG_SQUASHFS_LZO=y
+-CONFIG_SQUASHFS_XZ=y
+-CONFIG_SQUASHFS_ZSTD=y
+-CONFIG_BTRFS_FS=y
+-CONFIG_BTRFS_FS_POSIX_ACL=y
+-CONFIG_XFS_FS=y
+-CONFIG_XFS_POSIX_ACL=y
+-CONFIG_NFS_FS=y
+-CONFIG_NFS_V3=y
+-CONFIG_NFS_V4=y
+-CONFIG_NFSD=y
+-CONFIG_NFSD_V4=y
+-CONFIG_CIFS=y
+-CONFIG_CIFS_XATTR=y
+-CONFIG_CIFS_POSIX=y
+-CONFIG_CIFS_UPCALL=y
+-CONFIG_CIFS_DFS_UPCALL=y
+-CONFIG_SMB_SERVER=y
+-CONFIG_NTFS3_FS=y
+-CONFIG_NTFS3_LZX_XPRESS=y
+-CONFIG_UDF_FS=y
+-CONFIG_ISO9660_FS=y
+-CONFIG_JOLIET=y
+-CONFIG_MD=y
+-CONFIG_BLK_DEV_MD=y
+-CONFIG_MD_LINEAR=y
+-CONFIG_MD_RAID0=y
+-CONFIG_MD_RAID1=y
+-CONFIG_MD_RAID10=y
+-CONFIG_MD_RAID456=y
+-CONFIG_BLK_DEV_DM=y
+-CONFIG_DM_CRYPT=y
+-CONFIG_DM_SNAPSHOT=y
+-CONFIG_DM_MIRROR=y
+-CONFIG_DM_ZERO=y
+-CONFIG_BCACHE=y
+-CONFIG_BLK_DEV_NBD=y
+-CONFIG_ZSWAP=y
+-CONFIG_ZPOOL=y
+-CONFIG_KSM=y
+-CONFIG_HUGETLBFS=y
+-CONFIG_HUGETLB_PAGE=y
+-
+-##
+-## 9. USB misc / HID / 入力の追加
+-##
+-CONFIG_USB_LCD=y
+-CONFIG_USB_LEGOTOWER=y
+-CONFIG_USB_IOWARRIOR=y
+-CONFIG_USB_LD=y
+-CONFIG_USB_TRANCEVIBRATOR=y
+-CONFIG_PARPORT=y
+-
+-CONFIG_PARPORT_NOT_PC=y
+-CONFIG_USB_USS720=y
+-CONFIG_USB_IDMOUSE=y
+-CONFIG_USB_FTDI_ELAN=y
+-CONFIG_USB_APPLEDISPLAY=y
+-CONFIG_USB_CYTHERM=y
+-CONFIG_USB_CYPRESS_CY7C63=y
+-CONFIG_USB_YUREX=y
+-CONFIG_USB_EZUSB_FX2=y
+-CONFIG_USBIP_CORE=y
+-CONFIG_USBIP_VHCI_HCD=y
+-CONFIG_USBIP_HOST=y
+-CONFIG_USB_STORAGE_DATAFAB=y
+-CONFIG_USB_STORAGE_FREECOM=y
+-CONFIG_USB_STORAGE_ISD200=y
+-CONFIG_USB_STORAGE_JUMPSHOT=y
+-CONFIG_USB_STORAGE_KARMA=y
+-CONFIG_USB_STORAGE_ONETOUCH=y
+-CONFIG_USB_STORAGE_REALTEK=y
+-CONFIG_USB_STORAGE_SDDR09=y
+-CONFIG_USB_STORAGE_SDDR55=y
+-CONFIG_USB_STORAGE_USBAT=y
+-CONFIG_USB_XHCI_PCI=y
+-CONFIG_HID_ACRUX=y
+-CONFIG_HID_ACRUX_FF=y
+-CONFIG_HID_ASUS=y
+-CONFIG_HID_CHICONY=y
+-CONFIG_HID_CORSAIR=y
+-CONFIG_HID_ELAN=y
+-CONFIG_HID_GFRM=y
+-CONFIG_HID_HOLTEK=y
+-CONFIG_HID_KENSINGTON=y
+-CONFIG_HID_LOGITECH_HIDPP=y
+-CONFIG_HID_ORTEK=y
+-CONFIG_HID_SAITEK=y
+-CONFIG_HID_STEELSERIES=y
+-CONFIG_HID_SUNPLUS=y
+-CONFIG_HID_THRUSTMASTER=y
+-CONFIG_HID_VIVALDI=y
+-CONFIG_HID_ZEROPLUS=y
+-CONFIG_HID_ZYDACRON=y
+-CONFIG_I2C_HID_OF=y
+-CONFIG_I2C_HID_OF_ELAN=y
+-CONFIG_INPUT_UINPUT=y
+-CONFIG_JOYSTICK_IFORCE=y
+-CONFIG_JOYSTICK_IFORCE_USB=y
+-CONFIG_INPUT_TABLET=y
+-CONFIG_TABLET_USB_ACECAD=y
+-CONFIG_TABLET_USB_KBTAB=y
+-CONFIG_TABLET_USB_PEGASUS=y
+-
+-##
+-## 10. シリアル拡張・I2C/SPIブリッジ・組み込みペリフェラル
+-##
+-CONFIG_SERIAL_MAX310X=y
+-CONFIG_SERIAL_SC16IS7XX=y
+-CONFIG_SERIAL_SC16IS7XX_I2C=y
+-CONFIG_SERIAL_SC16IS7XX_SPI=y
+-CONFIG_SPI=y
+-CONFIG_I2C=y
+-CONFIG_I2C_MUX=y
+-CONFIG_I2C_MUX_GPIO=y
+-CONFIG_I2C_MUX_PCA954x=y
+-CONFIG_GPIO_PCA953X=y
+-CONFIG_GPIO_PCF857X=y
+-CONFIG_W1=y
+-CONFIG_W1_MASTER_GPIO=y
+-CONFIG_W1_SLAVE_THERM=y
+-CONFIG_PPS=y
+-CONFIG_PPS_CLIENT_LDISC=y
+-CONFIG_PTP_1588_CLOCK=y
+-CONFIG_PWM=y
+-CONFIG_PWM_PCA9685=y
+-CONFIG_IIO=y
+-CONFIG_IIO_BUFFER=y
+-CONFIG_IIO_KFIFO_BUF=y
+-CONFIG_IIO_CONFIGFS=y
+-
+-##
+-## 11. サウンド・メディア追加分
+-##
+-CONFIG_SND_USB_UA101=y
+-CONFIG_SND_USB_CAIAQ=y
+-CONFIG_SND_USB_6FIRE=y
+-CONFIG_SND_USB_HIFACE=y
+-CONFIG_SND_BCD2000=y
+-CONFIG_MEDIA_USB_SUPPORT=y
+-CONFIG_VIDEO_USBTV=y
+-
+-##
+-## 12. VM / virtio（VM基盤の土台）
+-##
+-CONFIG_VHOST=y
+-CONFIG_VHOST_NET=y
+-CONFIG_VIRTIO=y
+-CONFIG_VIRTIO_PCI=y
+-CONFIG_VIRTIO_PCI_LEGACY=y
+-CONFIG_VIRTIO_BLK=y
+-CONFIG_VIRTIO_NET=y
+-CONFIG_VIRTIO_CONSOLE=y
+-CONFIG_VIRTIO_MMIO=y
+-CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+-
+-##
+-## 13. crypto・ユーザー空間API・可観測性
+-##
+-CONFIG_CRYPTO_USER_API=y
+-CONFIG_CRYPTO_USER_API_HASH=y
+-CONFIG_CRYPTO_USER_API_SKCIPHER=y
+-CONFIG_CRYPTO_USER_API_AEAD=y
+-CONFIG_CRYPTO_LZ4=y
+-CONFIG_CRYPTO_LZ4HC=y
+-CONFIG_CRYPTO_ZSTD=y
+-CONFIG_MAGIC_SYSRQ=y
+-CONFIG_DEBUG_FS=y
+-CONFIG_DEVTMPFS=y
+-CONFIG_FTRACE=y
++# USER_NS は既定 =n のため =y へ変更
++CONFIG_USER_NS=y
+-- 
+2.54.0
+

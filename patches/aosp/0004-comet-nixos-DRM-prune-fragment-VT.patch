@@ -1,0 +1,229 @@
+From 76945fc1217ca5edd318119d2ef4c7d696fabc06 Mon Sep 17 00:00:00 2001
+From: kenh0u <21225079+kenh0u@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 00:04:16 +0900
+Subject: [PATCH 04/12] =?UTF-8?q?comet-nixos:=20DRM=20=E3=83=A2=E3=83=BC?=
+ =?UTF-8?q?=E3=83=89=20prune=20=E3=81=AE=E5=B8=B8=E6=99=82=E3=83=AD?=
+ =?UTF-8?q?=E3=82=B0=E5=8C=96=20+=20fragment=20=E3=81=AB=20VT=20=E8=BF=BD?=
+ =?UTF-8?q?=E8=A8=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- drm_modes.c / drm_probe_helper.c: prune/encoder 拒否されたモードを
+  pr_info([cn-mode]) で常時記録(GKI は dynamic debug 無効のため)
+- nixos_gki.fragment: CONFIG_VT* と UNIX98_PTYS を追記
+  (finix コンテナ内 labwc の libseat が /dev/tty0 を要求する)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ drivers/gpu/drm/drm_modes.c        |  8 ++-
+ drivers/gpu/drm/drm_probe_helper.c | 90 ++++++++++++++++++++++++++++--
+ nixos_gki.fragment                 |  9 +++
+ 3 files changed, 100 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_modes.c b/drivers/gpu/drm/drm_modes.c
+index 950d2e677e7c3..d318ced0b01bf 100644
+--- a/drivers/gpu/drm/drm_modes.c
++++ b/drivers/gpu/drm/drm_modes.c
+@@ -1339,9 +1339,11 @@ void drm_mode_prune_invalid(struct drm_device *dev,
+ 			}
+ 			if (verbose) {
+ 				drm_mode_debug_printmodeline(mode);
+-				DRM_DEBUG_KMS("Not using %s mode: %s\n",
+-					      mode->name,
+-					      drm_get_mode_status_name(mode->status));
++				/* comet-nixos: prune されたモードを常時記録
++				 * (GKI は dynamic debug 無効のため KMS dbg は出ない) */
++				pr_info("[cn-mode] Not using %s mode: %s\n",
++					mode->name,
++					drm_get_mode_status_name(mode->status));
+ 			}
+ 			drm_mode_destroy(dev, mode);
+ 		}
+diff --git a/drivers/gpu/drm/drm_probe_helper.c b/drivers/gpu/drm/drm_probe_helper.c
+index 0e5eadc6d44de..40ca1e1108f73 100644
+--- a/drivers/gpu/drm/drm_probe_helper.c
++++ b/drivers/gpu/drm/drm_probe_helper.c
+@@ -67,6 +67,31 @@
+ static bool drm_kms_helper_poll = true;
+ module_param_named(poll, drm_kms_helper_poll, bool, 0600);
+ 
++/* comet-nixos: cn_status_name() はヘッダ公開されていないため
++ * 計測ログ用の簡易変換をローカルに用意する */
++static const char *cn_status_name(enum drm_mode_status status)
++{
++	switch (status) {
++	case MODE_OK: return "MODE_OK";
++	case MODE_BAD_WIDTH: return "MODE_BAD_WIDTH";
++	case MODE_NO_INTERLACE: return "MODE_NO_INTERLACE";
++	case MODE_NO_DBLESCAN: return "MODE_NO_DBLESCAN";
++	case MODE_NO_VSCAN: return "MODE_NO_VSCAN";
++	case MODE_NOCLOCK: return "MODE_NOCLOCK";
++	case MODE_CLOCK_HIGH: return "MODE_CLOCK_HIGH";
++	case MODE_CLOCK_LOW: return "MODE_CLOCK_LOW";
++	case MODE_CLOCK_RANGE: return "MODE_CLOCK_RANGE";
++	case MODE_NO_REDUCED: return "MODE_NO_REDUCED";
++	case MODE_NO_STEREO: return "MODE_NO_STEREO";
++	case MODE_NO_420: return "MODE_NO_420";
++	case MODE_ONE_SIZE: return "MODE_ONE_SIZE";
++	case MODE_BAD: return "MODE_BAD";
++	case MODE_ERROR: return "MODE_ERROR";
++	case MODE_STALE: return "MODE_STALE";
++	default: return "MODE_UNKNOWN";
++	}
++}
++
+ static enum drm_mode_status
+ drm_mode_validate_flag(const struct drm_display_mode *mode,
+ 		       int flags)
+@@ -112,6 +137,10 @@ drm_mode_validate_pipeline(struct drm_display_mode *mode,
+ 			 * will not accept the mode anyway. If all encoders
+ 			 * reject the mode then, at exit, ret will not be
+ 			 * MODE_OK. */
++			/* comet-nixos: encoder 側の拒否を記録 */
++			pr_info("[cn-mode] %s encoder %s rejected: %s\n",
++				connector->name, encoder->name,
++				cn_status_name(*status));
+ 			continue;
+ 		}
+ 
+@@ -122,6 +151,11 @@ drm_mode_validate_pipeline(struct drm_display_mode *mode,
+ 		if (*status != MODE_OK) {
+ 			/* There is also no point in continuing for crtc check
+ 			 * here. */
++			/* comet-nixos: bridge 側の拒否を記録(bridge 無しは OK) */
++			pr_info("[cn-mode] %s bridge rejected: %s\n",
++				connector->name,
++				bridge ? cn_status_name(*status) :
++					 "MODE_OK(no bridge)");
+ 			continue;
+ 		}
+ 
+@@ -136,9 +170,19 @@ drm_mode_validate_pipeline(struct drm_display_mode *mode,
+ 				 * for this mode. Lets return now. */
+ 				return 0;
+ 			}
++			/* comet-nixos: crtc 側の拒否を記録 */
++			pr_info("[cn-mode] %s crtc %s rejected: %s\n",
++				connector->name, crtc->name,
++				cn_status_name(*status));
+ 		}
+ 	}
+ 
++	/* comet-nixos: encoder+crtc の組合せが 1 つも見つからなかった場合。
++	 * *status は最後の判定結果のまま(全ての段を MODE_OK で抜けると
++	 * MODE_OK のまま return 0 するため、実は prune されない)。 */
++	pr_info("[cn-mode] %s no encoder+crtc accepted (status=%s)\n",
++		connector->name, cn_status_name(*status));
++
+ 	return 0;
+ }
+ 
+@@ -401,21 +445,34 @@ static int __drm_helper_update_and_validate(struct drm_connector *connector,
+ 	if (connector->stereo_allowed)
+ 		mode_flags |= DRM_MODE_FLAG_3D_MASK;
+ 
++	/* comet-nixos: どの検証段でモードが落ちるかユーザー空間から見えるようにする
++	 * (GKI は dynamic debug 無効のため drm_dbg_kms は出ない) */
++#define CN_MODE_TRACE(conn, m, stage, st) \
++	pr_info("[cn-mode] %s " DRM_MODE_FMT " -> %s (%d) @%s\n", \
++		(conn)->name, DRM_MODE_ARG(m), cn_status_name(st), \
++		(int)(st), stage)
++
+ 	list_for_each_entry(mode, &connector->modes, head) {
+ 		if (mode->status != MODE_OK)
+ 			continue;
+ 
+ 		mode->status = drm_mode_validate_driver(dev, mode);
+-		if (mode->status != MODE_OK)
++		if (mode->status != MODE_OK) {
++			CN_MODE_TRACE(connector, mode, "driver", mode->status);
+ 			continue;
++		}
+ 
+ 		mode->status = drm_mode_validate_size(mode, maxX, maxY);
+-		if (mode->status != MODE_OK)
++		if (mode->status != MODE_OK) {
++			CN_MODE_TRACE(connector, mode, "size", mode->status);
+ 			continue;
++		}
+ 
+ 		mode->status = drm_mode_validate_flag(mode, mode_flags);
+-		if (mode->status != MODE_OK)
++		if (mode->status != MODE_OK) {
++			CN_MODE_TRACE(connector, mode, "flag", mode->status);
+ 			continue;
++		}
+ 
+ 		ret = drm_mode_validate_pipeline(mode, connector, ctx,
+ 						 &mode->status);
+@@ -430,13 +487,33 @@ static int __drm_helper_update_and_validate(struct drm_connector *connector,
+ 				return -EDEADLK;
+ 		}
+ 
+-		if (mode->status != MODE_OK)
++		if (mode->status != MODE_OK) {
++			CN_MODE_TRACE(connector, mode, "pipeline", mode->status);
+ 			continue;
++		}
+ 		mode->status = drm_mode_validate_ycbcr420(mode, connector);
++		if (mode->status != MODE_OK)
++			CN_MODE_TRACE(connector, mode, "ycbcr420", mode->status);
++	}
++
++	/* comet-nixos: 検証後に残ったモード数も数える */
++	{
++		int ok = 0;
++
++		list_for_each_entry(mode, &connector->modes, head)
++			if (mode->status == MODE_OK)
++				ok++;
++		pr_info("[cn-mode] %s validate done: ok=%d max=%ux%u min=%ux%u crtc=%d enc=%d\n",
++			connector->name, ok, dev->mode_config.max_width,
++			dev->mode_config.max_height,
++			dev->mode_config.min_width, dev->mode_config.min_height,
++			dev->mode_config.num_crtc,
++			dev->mode_config.num_encoder);
+ 	}
+ 
+ 	return 0;
+ }
++#undef CN_MODE_TRACE
+ 
+ /**
+  * drm_helper_probe_single_connector_modes - get complete set of display modes
+@@ -590,6 +667,11 @@ int drm_helper_probe_single_connector_modes(struct drm_connector *connector,
+ 
+ 	count = drm_helper_probe_get_modes(connector);
+ 
++	/* comet-nixos: probe の入口/経路を記録(どちらの fallback に入ったかも分かる) */
++	pr_info("[cn-mode] %s probe: status=%d maxX=%u maxY=%u get_modes=%d interlace=%d dblscan=%d\n",
++		connector->name, connector->status, maxX, maxY, count,
++		connector->interlace_allowed, connector->doublescan_allowed);
++
+ 	if (count == 0 && (connector->status == connector_status_connected ||
+ 			   connector->status == connector_status_unknown)) {
+ 		count = drm_add_modes_noedid(connector, 1024, 768);
+diff --git a/nixos_gki.fragment b/nixos_gki.fragment
+index 2528852a74cdf..5fd000de472f1 100644
+--- a/nixos_gki.fragment
++++ b/nixos_gki.fragment
+@@ -16,6 +16,15 @@ CONFIG_PID_NS=y
+ # USER_NS は既定 =n のため =y へ変更
+ CONFIG_USER_NS=y
+ 
++# ---- VT (finix コンテナ内の libseat/labwc が /dev/tty0 を要求する) ----
++# Android 既定は =n だが、外画面の Wayland セッション(seatd/libseat)に必要。
++# VT_CONSOLE は実体コンソールドライバ無しで /dev/tty0 のみの提供でも無害。
++CONFIG_VT=y
++CONFIG_VT_CONSOLE=y
++CONFIG_CONSOLE_TRANSLATIONS=y
++CONFIG_VT_HW_CONSOLE_BINDING=y
++CONFIG_UNIX98_PTYS=y
++
+ # ---- USB serial (=m。FTDI_SIO 等の一部は GKI 既定で =m 済み) ----
+ CONFIG_USB_SERIAL=m
+ CONFIG_USB_SERIAL_GENERIC=y
+-- 
+2.54.0
+

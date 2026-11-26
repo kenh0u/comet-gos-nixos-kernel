@@ -1,0 +1,56 @@
+From 8306c0a831fade3e26205739edfc728130e135d5 Mon Sep 17 00:00:00 2001
+From: kenhou <kenhou@local>
+Date: Tue, 29 Sep 2026 12:46:25 +0900
+Subject: [PATCH 07/12] =?UTF-8?q?comet-nixos:=20KernelSU=20=E3=82=92=20LKM?=
+ =?UTF-8?q?(=3Dm)=E5=8C=96=20+=20KSU=5FVERSION=20=E3=82=92=2032601=20?=
+ =?UTF-8?q?=E3=81=B8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- CONFIG_KSU=y → =m: kernelsu.ko を GKI モジュール(system_dlkm 配属)にして
+  boot 時 insmod に寄せる(世間の横並び。KSU 更新は ko 差し替えのみ)
+- Kbuild フォールバック KSU_VERSION 32600 → 32601(実機 Manager と一致。
+  32600 で焼いた際は Manager が version mismatch で操作不能になった)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ drivers/kernelsu/Kbuild | 6 ++++--
+ nixos_gki.fragment      | 8 +++++++-
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/kernelsu/Kbuild b/drivers/kernelsu/Kbuild
+index e81d107614d66..208f7591f4044 100644
+--- a/drivers/kernelsu/Kbuild
++++ b/drivers/kernelsu/Kbuild
+@@ -131,8 +131,10 @@ $(warning "KSU_GIT_VERSION not defined! It is better to make KernelSU a git repo
+ # 判定されない)。フォールバック既定値 16 は manager v3.3.0 の
+ # MINIMAL_SUPPORTED_KERNEL=32513 を満たさず、KernelSU manager が
+ # 「mismatch / requires update」表示になる。UAPI は 4 のままなので、
+-# 値だけ 32600(>=32513)に固定して回避(2026-09-26,)
+-ccflags-y += -DKSU_VERSION=32600
++# 実機に導入した KernelSU manager(32601=upstream rev 2601)と一致させる
++# (2026-09-26 は 32600 で焼いたため Manager 32601 と 1 定員が出て
++#  Manager 側の操作が不能になった履歴あり → 32601 に引き上げ, 2026-09-29)
++ccflags-y += -DKSU_VERSION=32601
+ endif
+ 
+ KSU_NEW_DCACHE_FLUSH := $(shell grep -q __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h ; echo $$?)
+diff --git a/nixos_gki.fragment b/nixos_gki.fragment
+index 866c3401eca6c..64ee5ee7550d8 100644
+--- a/nixos_gki.fragment
++++ b/nixos_gki.fragment
+@@ -109,4 +109,10 @@ CONFIG_CAN_ETAS_ES58X=m
+ CONFIG_USB_PRINTER=m
+ 
+ # ---- KernelSU (kprobe+LSM hook 方式。KPROBES/EXT4_FS は GKI 既定で成立) ----
+-CONFIG_KSU=y
++# LKM 化: =m で kernelsu.ko を GKI モジュールとしてビルドし、
++# 起動時に読み込む構成にする。KSU version の更新は .ko 差し替えのみで済む。
++CONFIG_KSU=m
++
++# ---- リリース文字列の短縮(64 文字制限対策, 2026-09-26) ----
++# CONFIG_LOCALVERSION_AUTO is not set
+-- 
+2.54.0
+

@@ -1,0 +1,251 @@
+From 69607c9404102cc5de8350df467991c528c589b7 Mon Sep 17 00:00:00 2001
+From: kenh0u <21225079+kenh0u@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 23:23:35 +0900
+Subject: [PATCH 03/12] =?UTF-8?q?comet-nixos:=20USB=20=E3=83=87=E3=83=90?=
+ =?UTF-8?q?=E3=82=A4=E3=82=B9=E3=83=89=E3=83=A9=E3=82=A4=E3=83=90=E3=82=92?=
+ =?UTF-8?q?=20=3Dm=20=E3=81=A7=E7=B6=B2=E7=BE=85(NixOS/Ubuntu=20=E5=9F=BA?=
+ =?UTF-8?q?=E6=BA=96)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+コンテナから USB デバイス(CH340/CP210x 等のシリアル、USB-CAN、
+USB Ethernet(QMI/RNDIS/MBIM)、BT USB ドングル等)を使えるよう、
+GKI 既定では無効のドライバを =m 化して system_dlkm に載せる。
+
+- nixos_gki.fragment に USB 関連の =m 定義を追加
+- modules.bzl の _COMMON_GKI_MODULES_LIST に新規 66 モジュールを追加
+  (依存で btintel/btmtk/btrtl/smsc phy/ezusb も追加)
+---
+ modules.bzl        | 71 ++++++++++++++++++++++++++++++++--
+ nixos_gki.fragment | 94 ++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 158 insertions(+), 7 deletions(-)
+
+diff --git a/modules.bzl b/modules.bzl
+index 52d92225aab4c..79f9858575349 100644
+--- a/modules.bzl
++++ b/modules.bzl
+@@ -7,16 +7,28 @@ This module contains a full list of kernel modules
+ """
+ 
+ _COMMON_GKI_MODULES_LIST = [
+-    # keep sorted
+-    "drivers/block/zram/zram.ko",
++        "drivers/block/zram/zram.ko",
+     "drivers/bluetooth/btbcm.ko",
++    "drivers/bluetooth/btintel.ko",
++    "drivers/bluetooth/btmtk.ko",
+     "drivers/bluetooth/btqca.ko",
++    "drivers/bluetooth/btrtl.ko",
+     "drivers/bluetooth/btsdio.ko",
++    "drivers/bluetooth/btusb.ko",
+     "drivers/bluetooth/hci_uart.ko",
+     "drivers/net/can/dev/can-dev.ko",
+     "drivers/net/can/slcan/slcan.ko",
++    "drivers/net/can/usb/esd_usb.ko",
++    "drivers/net/can/usb/etas_es58x/etas_es58x.ko",
++    "drivers/net/can/usb/gs_usb.ko",
++    "drivers/net/can/usb/kvaser_usb/kvaser_usb.ko",
++    "drivers/net/can/usb/mcba_usb.ko",
++    "drivers/net/can/usb/peak_usb/peak_usb.ko",
++    "drivers/net/can/usb/ucan.ko",
++    "drivers/net/can/usb/usb_8dev.ko",
+     "drivers/net/can/vcan.ko",
+     "drivers/net/mii.ko",
++    "drivers/net/phy/smsc.ko",
+     "drivers/net/ppp/bsd_comp.ko",
+     "drivers/net/ppp/ppp_deflate.ko",
+     "drivers/net/ppp/ppp_generic.ko",
+@@ -29,15 +41,68 @@ _COMMON_GKI_MODULES_LIST = [
+     "drivers/net/usb/ax88179_178a.ko",
+     "drivers/net/usb/cdc_eem.ko",
+     "drivers/net/usb/cdc_ether.ko",
++    "drivers/net/usb/cdc_mbim.ko",
+     "drivers/net/usb/cdc_ncm.ko",
++    "drivers/net/usb/qmi_wwan.ko",
+     "drivers/net/usb/r8152.ko",
+     "drivers/net/usb/r8153_ecm.ko",
++    "drivers/net/usb/rndis_host.ko",
+     "drivers/net/usb/rtl8150.ko",
++    "drivers/net/usb/smsc95xx.ko",
+     "drivers/net/usb/usbnet.ko",
+     "drivers/net/wwan/wwan.ko",
+     "drivers/usb/class/cdc-acm.ko",
++    "drivers/usb/class/cdc-wdm.ko",
++    "drivers/usb/class/usblp.ko",
++    "drivers/usb/misc/ezusb.ko",
++    "drivers/usb/serial/aircable.ko",
++    "drivers/usb/serial/ark3116.ko",
++    "drivers/usb/serial/belkin_sa.ko",
++    "drivers/usb/serial/ch341.ko",
++    "drivers/usb/serial/cp210x.ko",
++    "drivers/usb/serial/cyberjack.ko",
++    "drivers/usb/serial/cypress_m8.ko",
++    "drivers/usb/serial/digi_acceleport.ko",
++    "drivers/usb/serial/empeg.ko",
++    "drivers/usb/serial/f81232.ko",
++    "drivers/usb/serial/f81534.ko",
+     "drivers/usb/serial/ftdi_sio.ko",
++    "drivers/usb/serial/garmin_gps.ko",
++    "drivers/usb/serial/ipaq.ko",
++    "drivers/usb/serial/ipw.ko",
++    "drivers/usb/serial/ir-usb.ko",
++    "drivers/usb/serial/iuu_phoenix.ko",
++    "drivers/usb/serial/keyspan.ko",
++    "drivers/usb/serial/keyspan_pda.ko",
++    "drivers/usb/serial/kl5kusb105.ko",
++    "drivers/usb/serial/kobil_sct.ko",
++    "drivers/usb/serial/mct_u232.ko",
++    "drivers/usb/serial/metro-usb.ko",
++    "drivers/usb/serial/mos7720.ko",
++    "drivers/usb/serial/mos7840.ko",
++    "drivers/usb/serial/mxuport.ko",
++    "drivers/usb/serial/navman.ko",
++    "drivers/usb/serial/omninet.ko",
++    "drivers/usb/serial/opticon.ko",
++    "drivers/usb/serial/option.ko",
++    "drivers/usb/serial/oti6858.ko",
++    "drivers/usb/serial/pl2303.ko",
++    "drivers/usb/serial/qcaux.ko",
++    "drivers/usb/serial/qcserial.ko",
++    "drivers/usb/serial/quatech2.ko",
++    "drivers/usb/serial/safe_serial.ko",
++    "drivers/usb/serial/sierra.ko",
++    "drivers/usb/serial/spcp8x5.ko",
++    "drivers/usb/serial/symbolserial.ko",
++    "drivers/usb/serial/ti_usb_3410_5052.ko",
++    "drivers/usb/serial/upd78f0730.ko",
++    "drivers/usb/serial/usb-serial-simple.ko",
++    "drivers/usb/serial/usb_wwan.ko",
+     "drivers/usb/serial/usbserial.ko",
++    "drivers/usb/serial/visor.ko",
++    "drivers/usb/serial/whiteheat.ko",
++    "drivers/usb/serial/xr_serial.ko",
++    "drivers/usb/serial/xsens_mt.ko",
+     "kernel/kheaders.ko",
+     "lib/crypto/libarc4.ko",
+     "mm/zsmalloc.ko",
+@@ -53,10 +118,10 @@ _COMMON_GKI_MODULES_LIST = [
+     "net/bluetooth/bluetooth.ko",
+     "net/bluetooth/hidp/hidp.ko",
+     "net/bluetooth/rfcomm/rfcomm.ko",
+-    "net/can/can.ko",
+     "net/can/can-bcm.ko",
+     "net/can/can-gw.ko",
+     "net/can/can-raw.ko",
++    "net/can/can.ko",
+     "net/ieee802154/6lowpan/ieee802154_6lowpan.ko",
+     "net/ieee802154/ieee802154.ko",
+     "net/ieee802154/ieee802154_socket.ko",
+diff --git a/nixos_gki.fragment b/nixos_gki.fragment
+index bb2e0ea35a4af..2528852a74cdf 100644
+--- a/nixos_gki.fragment
++++ b/nixos_gki.fragment
+@@ -1,14 +1,100 @@
+-# nixos_gki.fragment — comet-nixos コンテナ拡張(最小化版)
++# nixos_gki.fragment — comet-nixos 拡張(最小化 namespace + USB デバイス網羅)
+ #
+ # 方針 :
+ #   - =y 化はコンテナで実際に使う namespace のみ。
+-#     NAMESPACES/UTS_NS/IPC_NS/NET_NS は GKI 既定で =y のため触らない
++#     NAMESPACES/UTS_NS/NET_NS は GKI 既定 =y のため触らない
+ #     (NET_NS は host モード運用のため分離も使わない)
+ #   - CGROUPS/MEMCG/CGROUP_SCHED/CPUSETS は GKI 既定 =y のまま放置
+-#     (Android 自身が必須。コンテナでは cgroup を使わない)
+-#   - コンソール/FB 系・USB シリアル等の組込み化は全廃止(標準 GKI 構成に戻す)
++#   - コンソール/FB 系の組込み化は廃止(標準 GKI 構成)
++#   - USB デバイスドライバは upstream NixOS/Ubuntu 基準で可能な限り =m 化し
++#     system_dlkm に載せる(ESP32 の CH340/CP210x、USB-CAN、USB-Ethernet、
++#     QMI/RNDIS モデム、Bluetooth USB ドングル等)
+ #
++# ---- namespace (コンテナ) ----
+ # PID_NS は gki_defconfig で明示的に =n されているため =y へ変更
+ CONFIG_PID_NS=y
+ # USER_NS は既定 =n のため =y へ変更
+ CONFIG_USER_NS=y
++
++# ---- USB serial (=m。FTDI_SIO 等の一部は GKI 既定で =m 済み) ----
++CONFIG_USB_SERIAL=m
++CONFIG_USB_SERIAL_GENERIC=y
++CONFIG_USB_SERIAL_SIMPLE=m
++CONFIG_USB_SERIAL_AIRCABLE=m
++CONFIG_USB_SERIAL_ARK3116=m
++CONFIG_USB_SERIAL_BELKIN=m
++CONFIG_USB_SERIAL_CH341=m
++CONFIG_USB_SERIAL_CP210X=m
++CONFIG_USB_SERIAL_CYBERJACK=m
++CONFIG_USB_SERIAL_CYPRESS_M8=m
++CONFIG_USB_SERIAL_DIGI_ACCELEPORT=m
++CONFIG_USB_SERIAL_EMPEG=m
++CONFIG_USB_SERIAL_F81232=m
++CONFIG_USB_SERIAL_F8153X=m
++CONFIG_USB_SERIAL_GARMIN=m
++CONFIG_USB_SERIAL_IPAQ=m
++CONFIG_USB_SERIAL_IPW=m
++CONFIG_USB_SERIAL_IR=m
++CONFIG_USB_SERIAL_IUU=m
++CONFIG_USB_SERIAL_KEYSPAN=m
++CONFIG_USB_SERIAL_KEYSPAN_PDA=m
++CONFIG_USB_SERIAL_KLSI=m
++CONFIG_USB_SERIAL_KOBIL_SCT=m
++CONFIG_USB_SERIAL_MCT_U232=m
++CONFIG_USB_SERIAL_METRO=m
++CONFIG_USB_SERIAL_MOS7720=m
++CONFIG_USB_SERIAL_MOS7840=m
++CONFIG_USB_SERIAL_MXUPORT=m
++CONFIG_USB_SERIAL_NAVMAN=m
++CONFIG_USB_SERIAL_OMNINET=m
++CONFIG_USB_SERIAL_OPTICON=m
++CONFIG_USB_SERIAL_OPTION=m
++CONFIG_USB_SERIAL_OTI6858=m
++CONFIG_USB_SERIAL_PL2303=m
++CONFIG_USB_SERIAL_QCAUX=m
++CONFIG_USB_SERIAL_QUALCOMM=m
++CONFIG_USB_SERIAL_QT2=m
++CONFIG_USB_SERIAL_SPCP8X5=m
++CONFIG_USB_SERIAL_SAFE=m
++CONFIG_USB_SERIAL_SIERRAWIRELESS=m
++CONFIG_USB_SERIAL_SYMBOL=m
++CONFIG_USB_SERIAL_TI=m
++CONFIG_USB_SERIAL_UPD78F0730=m
++CONFIG_USB_SERIAL_VISOR=m
++CONFIG_USB_SERIAL_WHITEHEAT=m
++CONFIG_USB_SERIAL_XR=m
++CONFIG_USB_SERIAL_XSENS_MT=m
++# USB_SERIAL_WWAN は OPTION/QCserial 等の共通下支え
++CONFIG_USB_SERIAL_WWAN=m
++
++# ---- USB Ethernet / モデム (=m。AX88179/RTL8152 等は既定で =m 済み) ----
++CONFIG_USB_USBNET=m
++CONFIG_USB_NET_QMI_WWAN=m
++CONFIG_USB_NET_RNDIS_HOST=m
++CONFIG_USB_NET_CDC_MBIM=m
++CONFIG_USB_NET_SMSC95XX=m
++CONFIG_USB_WDM=m
++
++# ---- USB Bluetooth ドングル ----
++CONFIG_BT=m
++CONFIG_BT_HCIBTUSB=m
++CONFIG_BT_HCIBTUSB_BCM=y
++CONFIG_BT_HCIBTUSB_MTK=y
++CONFIG_BT_HCIBTUSB_RTL=y
++
++# ---- USB CAN (candleLight gs_usb / PEAK / Kvaser 等) ----
++CONFIG_CAN=m
++CONFIG_CAN_RAW=m
++CONFIG_CAN_BCM=m
++CONFIG_CAN_DEV=m
++CONFIG_CAN_GS_USB=m
++CONFIG_CAN_PEAK_USB=m
++CONFIG_CAN_KVASER_USB=m
++CONFIG_CAN_8DEV_USB=m
++CONFIG_CAN_MCBA_USB=m
++CONFIG_CAN_UCAN=m
++CONFIG_CAN_ESD_USB=m
++CONFIG_CAN_ETAS_ES58X=m
++
++# ---- その他 USB クラス ----
++CONFIG_USB_PRINTER=m
+-- 
+2.54.0
+
