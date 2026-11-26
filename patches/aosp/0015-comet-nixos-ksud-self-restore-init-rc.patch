@@ -10,6 +10,11 @@ Subject: [PATCH] comet-nixos: ksud の自己復旧を init.rc フックに追加
   (Manager が「未インストール」表示)。
 - toybox cp -n (上書きしない) なので、既存の /data/adb/ksud (boot-patch 等で
   更新された新しい版を含む) は保持される。
+- cp 直後に toybox chcon で u:object_r:ksu_file:s0 へ relabel する。cp が
+  作ったファイルは adb_data_file のままになり、続く init からの
+  `exec ... /data/adb/ksud` が `avc: denied { execute }` (scontext=init,
+  permissive=0) で拒否されて init が SIGABRT するため (relocked user 版で実測)。
+  ksu_file はカーネルが `domain` へ全許可を注入する file_type。
 - exec の seclabel で ksu ドメイン (カーネル側で permissive / allow all を
   注入) に遷移して実行する。init の builtin (mkdir/copy/chmod 等) は
   u:r:<ctx> プレフィックスに対応せず init 自身のコンテキストで動くため、
@@ -19,18 +24,21 @@ OS 側には ksud バイナリを /system/bin/ksud として PRODUCT_PACKAGES �
 含める必要がある (system の file_contexts 既定 system_file のまま)。
 
 Co-Authored-By: Claude <noreply@anthropic.com>
----
+
 diff --git a/drivers/kernelsu/runtime/ksud_integration.c b/drivers/kernelsu/runtime/ksud_integration.c
-index 5bf84cb..f75f281 100644
+index 5bf84cb..0c85574 100644
 --- a/drivers/kernelsu/runtime/ksud_integration.c
 +++ b/drivers/kernelsu/runtime/ksud_integration.c
-@@ -34,6 +34,9 @@ static const char KERNEL_SU_RC[] =
+@@ -34,6 +34,12 @@ static const char KERNEL_SU_RC[] =
      "\n"
      "on post-fs-data\n"
      "    start logd\n"
 +    // userdata wipe 直後等で /data/adb/ksud が失われている場合、system に同梱した
 +    // ksud から自己復旧する。既存の /data/adb/ksud は上書きしない。
 +    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- /system/bin/toybox cp -n /system/bin/ksud " KSUD_PATH "\n"
++    // adb_data_file のままだと init からの exec が SELinux に拒否されるため、
++    // カーネルが登録する ksu_file (domain に全許可) へ relabel する
++    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- /system/bin/toybox chcon u:object_r:" KERNEL_SU_FILE ":s0 " KSUD_PATH "\n"
      // We should wait for the post-fs-data finish
      "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " post-fs-data\n"
      "\n"

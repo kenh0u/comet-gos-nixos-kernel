@@ -4,7 +4,7 @@ GrapheneOS 公式カーネルツリー（branch `17`, `6.1.177-android14-11`）�
 
 対象デバイス: Google Pixel 9 Pro Fold (`comet` / Tensor G4 / `zumapro`)
 
-> **検証状況**: GrapheneOS フルビルド（`user` バリアント）との組み合わせで実機ブート、KernelSU full モード（`lkm: true`, `late_load: false`）、および NixOS 26.05 (`systemd` PID 1) コンテナ + Termux-X11 GUI の稼働を実機で確認済みです。`0015` (ksud 自己復旧) は `2026112602` で検証中です。
+> **検証状況**: GrapheneOS フルビルド（`user` バリアント）との組み合わせで実機ブート、KernelSU full モード（`lkm: true`, `late_load: false`）、および NixOS 26.05 (`systemd` PID 1) コンテナ + Termux-X11 GUI の稼働を実機で確認済みです。`0015` (ksud 自己復旧) は `2026112603` で検証中です。
 
 ## 構成
 
@@ -37,6 +37,7 @@ ksu/              drivers/kernelsu (tgid != 1 hook 対応 + ksud 自己復旧込
 - **ksud 自己復旧 (userdata wipe 対応, `0015`)**:
   - OS 側に `ksud` を `cc_prebuilt_binary` として `/system/bin/ksud` に同梱し、`PRODUCT_PACKAGES += ksud` で組み込む。
   - カーネル注入の `on post-fs-data` 冒頭で `ksu` ドメインの `exec` として `/system/bin/toybox cp -n /system/bin/ksud /data/adb/ksud` を実行し、無い場合に復元する (`-n` なので既存分は上書きしない)。
+  - 直後に `toybox chcon u:object_r:ksu_file:s0 /data/adb/ksud` で relabel する。`adb_data_file` のままだと init からの `exec` が SELinux に拒否され init が abort する。
   - これにより userdata wipe 直後の `user` 版 + relocked 端末でも、初回起動から KernelSU が有効になる。
 
 ## ビルド (NixOS ホスト)
