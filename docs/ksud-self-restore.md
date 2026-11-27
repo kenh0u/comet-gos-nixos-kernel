@@ -53,7 +53,7 @@ PRODUCT_PACKAGES += ksud
 ```
 on post-fs-data
     start logd
-    exec u:r:ksu:s0 root -- /system/bin/toybox cp -n /system/bin/ksud /data/adb/ksud
+    exec u:r:ksu:s0 root -- /system/bin/toybox cp -f /system/bin/ksud /data/adb/ksud
     exec u:r:ksu:s0 root -- /system/bin/toybox chcon u:object_r:ksu_file:s0 /data/adb/ksud
     exec u:r:ksu:s0 root -- /data/adb/ksud post-fs-data
 ```
@@ -64,11 +64,11 @@ on post-fs-data
 |---|---|---|
 | init builtin の `copy /system/bin/ksud /data/adb/ksud` | 復元されない | `u:r:<ctx>` の seclabel は `exec` / `exec_start` にのみ有効。builtin は init 自身のコンテキストで動き、`/data/adb` 配下への書き込みが拒否される |
 | `exec ... toybox cp -n ...` のみ | **init が SIGABRT、起動しない** | `cp` が作ったファイルは `adb_data_file` のまま。続く `exec ... /data/adb/ksud` が `avc: denied { execute }` (scontext=`init`, permissive=0) となり、init が abort する |
-| `exec ... cp -n` + `exec ... chcon ksu_file` | **成功** | `ksu_file` はカーネルが `domain` へ全許可を注入する file_type |
+| `exec ... cp -f` (当初 `cp -n`) + `exec ... chcon ksu_file` | **成功** | `ksu_file` はカーネルが `domain` へ全許可を注入する file_type |
 
 補足:
 
-- `cp -n` は上書きしないので、既存の `/data/adb/ksud` はそのまま残ります。
+- `cp -f` で起動ごとに `/system/bin/ksud` を `/data/adb/ksud` へ上書き同期します (約 6MB、直後に毎回 `chcon ksu_file` を実行)。relocked `user` 版では `kernelsu.ko` と `/system/bin/ksud` が常に OTA でペア更新され、端末側から boot-patch 経由で `ksud` だけを更新する経路もないため、`cp -n` で古い `/data/adb/ksud` が残ってバージョン乖離→root 喪失となる事故を防ぐ設計にしています。
 - `/data/adb` が無い初回起動では、直前の init 処理 (`on post-fs-data` の `mkdir /data/adb 0700` 相当) で作成済みの前提です。relocked `user` 版でのみ検証しています。
 - この rc は full モード (LKM を first-stage init からロード) でのみ注入されます。`late_load: true` では注入されません。
 

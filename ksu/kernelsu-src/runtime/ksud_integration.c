@@ -34,9 +34,9 @@ static const char KERNEL_SU_RC[] =
     "\n"
     "on post-fs-data\n"
     "    start logd\n"
-    // userdata wipe 直後等で /data/adb/ksud が失われている場合、system に同梱した
-    // ksud から自己復旧する。既存の /data/adb/ksud は上書きしない。
-    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- /system/bin/toybox cp -n /system/bin/ksud " KSUD_PATH "\n"
+    // userdata wipe 直後や OTA 更新時に、system に同梱した ksud から /data/adb/ksud を
+    // 毎回同期する (kernelsu.ko とのバージョン乖離による root 喪失を防ぐため cp -f)。
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- /system/bin/toybox cp -f /system/bin/ksud " KSUD_PATH "\n"
     // adb_data_file のままだと init からの exec が SELinux に拒否されるため、
     // カーネルが登録する ksu_file (domain に全許可) へ relabel する
     "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- /system/bin/toybox chcon u:object_r:" KERNEL_SU_FILE ":s0 " KSUD_PATH "\n"
