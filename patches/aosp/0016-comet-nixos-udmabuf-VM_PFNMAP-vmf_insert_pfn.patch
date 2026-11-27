@@ -1,0 +1,62 @@
+From: kenh0u <21225079+kenh0u@users.noreply.github.com>
+Subject: [PATCH] comet-nixos: udmabuf: VM_PFNMAP + vmf_insert_pfn 化
+ (upstream 7d79cd784470 "udmabuf: use vmf_insert_pfn and VM_PFNMAP for
+ handling mmap" の 6.1 backport)
+
+Ghostty (GTK4-X11 + Mesa llvmpipe) が /dev/udmabuf を mmap するたびに
+dma_buf_mmap_internal の WARN (VM_SPECIAL 未設定) が出て、アプリ終了時に
+  Bad page map (refcount:0 mapcount:-1, file:dmabuf fault:udmabuf_vm_fault)
+  → Bad page state (release_udmabuf → free_large_kmalloc, non-NULL mapping)
+  → buddy/pcp の list_del corruption → Kernel panic
+に至る問題 (GOS 2026112603, uptime 10865s〜10979s, pstore 20261127-0405)。
+
+原因: 6.1 の udmabuf_vm_fault は vmf->page = pages[pgoff]; get_page() で
+"struct page あり" の normal mapping を作る。VMA は vma_set_file() で
+dmabuf の anon inode に付け替えられるため、元の memfd (shmem) の
+i_mmap には繋がっておらず、memfd が unlink/evict される際の
+unmap_mapping_range がこの VMA に届かない。shmem_undo_range は
+folio_mapped な folio を truncate し、filemap_unaccount_folio の
+mapping_exiting 救済 free (page_mapcount_reset + folio_ref_sub) が
+まだ map されている folio を解放 → mapcount:-1 の bad pte になる。
+
+修正 (upstream 同等): mmap 時に VM_PFNMAP|VM_DONTEXPAND|VM_DONTDUMP を
+立て、fault は vmf_insert_pfn() で pfn のみを共有する。PTE は special
+扱いとなり rmap/refcount の対象外になるため、shmem truncate と
+udmabuf の refcount が干渉しなくなる。WARN も消える。
+
+併せて 0010 (mapping_exiting 救済 free の廃止 + ratelimit) は
+2026112603 ビルドで脱落していたため再適用を前提とする。
+
+Link: https://github.com/torvalds/linux/commit/7d79cd7844709b7c7f38f1dc5b6b91ea8e8b7b16
+Upstream-Status: Backport (v6.11)
+Signed-off-by: kenh0u <21225079+kenh0u@users.noreply.github.com>
+
+diff --git a/drivers/dma-buf/udmabuf.c b/drivers/dma-buf/udmabuf.c
+index 97e0ea90e..bc3f2f4fe 100644
+--- a/drivers/dma-buf/udmabuf.c
++++ b/drivers/dma-buf/udmabuf.c
+@@ -33,12 +33,13 @@ static vm_fault_t udmabuf_vm_fault(struct vm_fault *vmf)
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct udmabuf *ubuf = vma->vm_private_data;
+ 	pgoff_t pgoff = vmf->pgoff;
++	unsigned long pfn;
+ 
+ 	if (pgoff >= ubuf->pagecount)
+ 		return VM_FAULT_SIGBUS;
+-	vmf->page = ubuf->pages[pgoff];
+-	get_page(vmf->page);
+-	return 0;
++
++	pfn = page_to_pfn(ubuf->pages[pgoff]);
++	return vmf_insert_pfn(vma, vmf->address, pfn);
+ }
+ 
+ static const struct vm_operations_struct udmabuf_vm_ops = {
+@@ -54,6 +55,7 @@ static int mmap_udmabuf(struct dma_buf *buf, struct vm_area_struct *vma)
+ 
+ 	vma->vm_ops = &udmabuf_vm_ops;
+ 	vma->vm_private_data = ubuf;
++	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+ 	return 0;
+ }
+ 

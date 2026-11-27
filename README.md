@@ -20,9 +20,10 @@ patches/aosp/     aosp/ 側パッチシリーズ (comet-nixos)
                   0012 CONFIG_CFI_PERMISSIVE=y
                   0013-0014 DRM ログ ratelimit / コメント調整
                   0015 ksud 自己復旧 (init.rc フックで /system/bin/ksud → /data/adb/ksud)
+                  0016 udmabuf を VM_PFNMAP + vmf_insert_pfn 化 (upstream 7d79cd784470 の backport)
 patches/device-os/ GrapheneOS OS 側 (vendor/google_devices/comet): ksud を /system/bin/ksud として同梱するための Android.bp と comet.mk 追記行
 patches/device/   private/devices/google/comet 側 (fragment filegroup 登録 + device.bazelrc)
-patches/kleaf/    build/kernel/kleaf/hermetic_tools.bzl の NixOS ホストビルド対応
+patches/kleaf/    NixOS ホストビルド対応 (hermetic_tools.bzl, ddk_uapi_headers.bzl, build-tools cp)
 nixos/            nixos_gki.fragment (namespace, cgroup pids, tmpfs xattr/POSIX ACL, KSU 等)
 ksu/              drivers/kernelsu (tgid != 1 hook 対応 + ksud 自己復旧込み) + kernel/ksu_module_exports.c
 ```
@@ -38,6 +39,9 @@ ksu/              drivers/kernelsu (tgid != 1 hook 対応 + ksud 自己復旧込
 - **ksud 自己復旧 (userdata wipe 対応, `0015`)**: `user` 版 + relocked 端末で userdata wipe 直後の初回起動から KernelSU を有効にします。詳細 (失敗した試みの内訳、OS 側の組み込み方、署名鍵の罠) は [docs/ksud-self-restore.md](docs/ksud-self-restore.md) を参照。
   - OS 側に `ksud` を `cc_prebuilt_binary` として `/system/bin/ksud` に同梱 (`patches/device-os/`)。
   - カーネル注入の `on post-fs-data` 冒頭で、`ksu` ドメインの `exec` として `toybox cp -n` で `/data/adb/ksud` へ復元し、`toybox chcon` で `ksu_file` へ relabel してから `ksud post-fs-data` を起動。
+
+- **udmabuf 起因の kernel panic 対処 (`0016`)**: GTK4-X11 + llvmpipe の Ghostty が `/dev/udmabuf` を mmap すると、アプリ終了頃に `Bad page map` → `list_del corruption` → panic していました。upstream の `VM_PFNMAP` 化を backport して根治します。原因解析・却下した代替案・検証手順は [docs/udmabuf-panic-fix.md](docs/udmabuf-panic-fix.md) を参照。**`2026112604` として OTA 生成済みですが、実機適用はまだ (2026-11-27 時点)**。
+- **パッチシリーズの脱落に注意**: `2026112601`〜`2603` のビルドでは `0010`/`0011`/`0014` がツリーに入っていませんでした (`git status` には KSU 系しか出ないため気付けない)。ビルド前に dist の `vmlinux` の目印文字列 (`leaking; ratelimited` 等) を確認してください。
 
 ## ビルド (NixOS ホスト)
 

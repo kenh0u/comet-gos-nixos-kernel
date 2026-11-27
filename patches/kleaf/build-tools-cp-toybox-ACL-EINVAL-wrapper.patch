@@ -1,0 +1,33 @@
+diff --git a/prebuilts/build-tools/path/linux-x86/cp b/prebuilts/build-tools/path/linux-x86/cp
+deleted file mode 120000
+index c6b4b1f8..00000000
+--- a/prebuilts/build-tools/path/linux-x86/cp
++++ /dev/null
+@@ -1 +0,0 @@
+-../../linux-x86/bin/toybox
+\ No newline at end of file
+diff --git a/prebuilts/build-tools/path/linux-x86/cp b/prebuilts/build-tools/path/linux-x86/cp
+new file mode 100755
+index 00000000..0a6b5f62
+--- /dev/null
++++ b/prebuilts/build-tools/path/linux-x86/cp
+@@ -0,0 +1,19 @@
++#!/bin/bash
++# comet-nixos(2026-11-27): kleaf hermetic-tools の cp は toybox で、btrfs の
++# system.posix_acl_access に未マップ uid があると cp -p の setxattr が EINVAL。
++# "preserving permissions" で失敗した場合のみ -p/-a を外して再実行する(ACL/xattr は破棄)。
++REAL="$(dirname "$(readlink -f "$0")")/../../linux-x86/bin/toybox"
++out=$("$REAL" cp "$@" 2>&1); rc=$?
++case "$out" in *"preserving permissions"*)
++  args=(); for a in "$@"; do
++    case "$a" in
++      -p|-a|--preserve|--preserve=*) ;;
++      -*) args+=("$a") ;;
++      *) args+=("$a") ;;
++    esac
++  done
++  "$REAL" cp "${args[@]}"
++  exit $?
++esac
++[ -n "$out" ] && printf '%s\n' "$out" >&2
++exit $rc
