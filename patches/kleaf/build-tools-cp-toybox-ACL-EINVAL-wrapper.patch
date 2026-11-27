@@ -11,7 +11,7 @@ new file mode 100755
 index 00000000..0a6b5f62
 --- /dev/null
 +++ b/prebuilts/build-tools/path/linux-x86/cp
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,26 @@
 +#!/bin/bash
 +# comet-nixos(2026-11-27): kleaf hermetic-tools の cp は toybox で、btrfs の
 +# system.posix_acl_access に未マップ uid があると cp -p の setxattr が EINVAL。
@@ -19,10 +19,20 @@ index 00000000..0a6b5f62
 +REAL="$(dirname "$(readlink -f "$0")")/../../linux-x86/bin/toybox"
 +out=$("$REAL" cp "$@" 2>&1); rc=$?
 +case "$out" in *"preserving permissions"*)
-+  args=(); for a in "$@"; do
++  args=(); end_opts=0
++  for a in "$@"; do
++    if [ $end_opts -eq 1 ]; then args+=("$a"); continue; fi
 +    case "$a" in
-+      -p|-a|--preserve|--preserve=*) ;;
-+      -*) args+=("$a") ;;
++      --) end_opts=1; args+=("$a") ;;
++      -p|--preserve|--preserve=*) ;;
++      -a) args+=("-dR") ;;
++      --*) args+=("$a") ;;
++      -?*)
++        s="${a#-}"
++        s="${s//p/}"
++        s="${s//a/dR}"
++        [ -n "$s" ] && args+=("-$s")
++        ;;
 +      *) args+=("$a") ;;
 +    esac
 +  done
